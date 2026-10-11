@@ -135,7 +135,8 @@ class EndToEnd(unittest.TestCase):
             "CLAUDE_ROTATE_CLAUDE_BIN": str(MOCK), "MOCK_LOG": str(self.log),
             "MOCK_TRANSCRIPTS": str(root / "transcripts"), "MOCK_LIMIT_TEXT": limit_text,
         }
-        self.env.pop("CLAUDE_CONFIG_DIR", None)
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_ROTATE_ACCOUNT", "CLAUDE_ROTATE_RUN"):
+            self.env.pop(k, None)  # the tests may themselves run inside a wrapper session
         self.rotate(["account", "add", "dev", "--no-login"])
 
     def tearDown(self):
@@ -197,6 +198,15 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertEqual([i["account"] for i in self.invocations()], ["default"])
         self.assertIn("default", self.state())  # the limit is still recorded for next time
+
+    def test_subcommands_run_on_main_login_without_hooks(self):
+        r = self.rotate(["auth", "status"], CLAUDE_CONFIG_DIR="/should/be/dropped")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        inv = self.invocations()
+        self.assertEqual(len(inv), 1)
+        self.assertEqual(inv[0]["account"], "no-wrapper")
+        self.assertEqual(inv[0]["argv"], ["auth", "status"])
+        self.assertEqual(r.stderr, "")
 
     def test_starts_on_free_account_and_stops_when_all_limited(self):
         r = self.rotate(["-p", "x"], MOCK_LIMITED="default,dev")

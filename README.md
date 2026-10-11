@@ -19,72 +19,101 @@ the conversation over. `claude-rotate` is a single-file Python wrapper that:
 Works on macOS and Linux with Python 3.9+ and Claude Code 2.1.x. Only use accounts you are
 entitled to use under Anthropic's terms.
 
-## Install
+## Quick start
 
-```sh
-curl -fsSLo ~/.local/bin/claude-rotate \
-  https://raw.githubusercontent.com/sungman-cho/claude-rotate/main/claude-rotate
-chmod +x ~/.local/bin/claude-rotate
+Five steps, about two minutes. Assumes `claude` is installed and signed in to your main account.
+
+1. **Install the wrapper.**
+
+   ```sh
+   mkdir -p ~/.local/bin
+   curl -fsSLo ~/.local/bin/claude-rotate \
+     https://raw.githubusercontent.com/OpenGraphLabs/claude-rotate/main/claude-rotate
+   chmod +x ~/.local/bin/claude-rotate
+   claude-rotate account list       # should print your main login as "default"
+   ```
+
+   If the last command says `command not found`, add `export PATH="$HOME/.local/bin:$PATH"` to
+   your shell rc file and open a new terminal.
+
+2. **Add a second account.** Pick any short name; it only labels the account locally.
+
+   ```sh
+   claude-rotate account add personal
+   ```
+
+   This creates `~/.claude-accounts/accounts/personal` and runs `claude auth login` for it. Your
+   browser opens the claude.ai login page. Sign in as the *second* account. If the browser is
+   already signed in to the first one, copy the login link into a private window instead.
+
+3. **Check both accounts are listed.**
+
+   ```sh
+   claude-rotate account list
+   ```
+
+   ```
+   default          you@company.com                      available
+   personal         you@gmail.com                        available
+   ```
+
+4. **Make `claude` use the wrapper.** Add to `~/.zshrc` or `~/.bashrc` and open a new terminal:
+
+   ```sh
+   alias claude=claude-rotate
+   ```
+
+5. **Work as usual.** Run `claude` in any project. The first line of output names the account in
+   use. When that account hits its limit, the session is stopped and resumed on the next one:
+
+   ```
+   [claude-rotate] account default (you@company.com)
+   ...
+   [claude-rotate] default hit its usage limit (free again around 10-06 02:00)
+   [claude-rotate] resuming session 1f3c6d2a-... on personal
+   [claude-rotate] account personal (you@gmail.com)
+   ```
+
+   Claude continues the turn it was in the middle of. Nothing else changes: same project, same
+   settings, same memory, same transcript.
+
+### Day to day
+
+- **Which account am I on?** The `[claude-rotate] account ...` line at the top of every session,
+  or `claude-rotate account list` from another terminal.
+- **An account is marked limited but I know it has reset.** `claude-rotate account reset NAME`
+  clears the record. The wrapper only trusts the reset time printed in the limit message; when
+  it cannot parse one it waits `cooldown_minutes` (default 60) before trying that account again.
+- **Add a third account.** `claude-rotate account add NAME`. Accounts rotate in the order added;
+  edit `order` in `~/.claude-accounts/config.json` to change it.
+- **Sign in again** (token expired, switched email): `claude-rotate account login NAME`.
+- **Run plain `claude` without rotation.** `command claude ...` bypasses the alias.
+- **Resume a session that was moved.** `claude --resume <id>` works on every account because
+  transcripts are shared. The wrapper starts it on whichever account is free.
+- **`claude auth`, `claude mcp`, `claude doctor`, ...** Subcommands are not sessions; the wrapper
+  runs them on your main login exactly as typed. Add MCP servers there and every account gets
+  them. To run one against another account: `CLAUDE_CONFIG_DIR=~/.claude-accounts/accounts/NAME
+  command claude auth status`.
+- **Remove an account.** Sign it out first if you want the keychain entry gone
+  (`CLAUDE_CONFIG_DIR=~/.claude-accounts/accounts/NAME command claude auth logout`), then delete
+  `~/.claude-accounts/accounts/NAME` and remove it from `order` in `config.json`.
+
+## Command reference
+
 ```
-
-`~/.local/bin` must be on your `PATH` and `claude` must already be installed and signed in to
-your main account (that login is the account named `default`).
-
-Most people want every `claude` invocation to go through the wrapper:
-
-```sh
-# ~/.zshrc or ~/.bashrc
-alias claude=claude-rotate
-```
-
-The wrapper finds the real binary as the first `claude` on `PATH` that is not itself, so the
-alias does not loop. Set `CLAUDE_ROTATE_CLAUDE_BIN` to point at a specific binary instead.
-
-## Add accounts
-
-```sh
-claude-rotate account add work2          # creates the account dir, then runs `claude auth login`
+claude-rotate [claude args...]                  run claude on the first account that is not limited
+claude-rotate account add NAME [--email E] [--no-login]
+claude-rotate account login NAME [--email E]    sign in (again) on an existing account
 claude-rotate account list
-```
-
-```
-default          you@example.com                      available
-work2            you+2@example.com                    limited until 10-06 02:00
-```
-
-`account add` opens the normal Claude Code login flow for the new account. If your browser is
-already signed in to another claude.ai account, open the login link in a private window.
-Accounts rotate in the order they were added (`order` in `~/.claude-accounts/config.json`).
-
-Other commands:
-
-```
-claude-rotate account login NAME [--email E]   sign in (again) on an existing account
-claude-rotate account reset [NAME]             forget recorded limits
+claude-rotate account reset [NAME]              forget recorded limits
 claude-rotate account help
 ```
 
-## Use
-
-```sh
-claude-rotate                       # interactive session, like `claude`
-claude-rotate -p "summarise this"   # print mode
-claude-rotate --resume <id>         # any claude flag passes through
-```
-
-What you see when a limit hits:
-
-```
-[claude-rotate] account default (you@example.com)
-...
-[claude-rotate] default hit its usage limit (free again around 10-06 02:00)
-[claude-rotate] resuming session 1f3c...-... on work2
-[claude-rotate] account work2 (you+2@example.com)
-```
-
-The resumed session starts with the prompt from `continue_prompt` in `config.json`, so Claude
-picks up the turn that was cut off. If you quit an interactive session yourself after the limit
-message, the wrapper does not relaunch; it just remembers the limit for next time.
+Every `claude` flag passes through (`-p`, `--model`, `--resume`, `--dangerously-skip-permissions`,
+...). The wrapper finds the real binary as the first `claude` on `PATH` that is not itself, so the
+alias does not loop; set `CLAUDE_ROTATE_CLAUDE_BIN` to use a specific binary. If you quit an
+interactive session yourself after the limit message, the wrapper does not relaunch; it just
+remembers the limit for next time.
 
 ## How it works
 

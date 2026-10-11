@@ -22,6 +22,7 @@ usage:
   claude-rotate account list
   claude-rotate account reset [NAME]          forget recorded limits
   claude-rotate account help                  print this text
+  claude-rotate auth|mcp|... [args]           claude subcommands run on the main login, unchanged
 
 Environment: CLAUDE_ROTATE_HOME (default ~/.claude-accounts), CLAUDE_ROTATE_SHARED_DIR (default
 ~/.claude), CLAUDE_ROTATE_CLAUDE_BIN (default: the first `claude` on PATH that is not this file).
@@ -108,6 +109,13 @@ VALUE_FLAGS = {
         "--cloud", "-d", "--debug", "--from-pr", "--prompt-suggestions", "--remote-control", "-r",
         "--resume", "--teleport", "-w", "--worktree",
     ], "optional"),
+}
+# claude subcommands (`claude auth`, `claude mcp`, ...). They are not sessions, so the wrapper runs
+# them on the main login as they are, without hooks or rotation.
+SUBCOMMANDS = {
+    "agents", "attach", "auth", "auto-mode", "doctor", "gateway", "import", "install", "logs", "mcp",
+    "plugin", "plugins", "purge", "respawn", "rm", "sessions", "setup-token", "stop", "kill",
+    "ultrareview", "update", "upgrade",
 }
 # Flags that choose or create the conversation; the wrapper drops them when it resumes a session.
 SESSION_FLAGS = {
@@ -588,6 +596,9 @@ def main(argv):
             return 1
     if argv[:1] == ["account"]:
         return cmd_account(argv[1:])
+    if argv and argv[0] in SUBCOMMANDS:
+        claude = find_claude()
+        os.execve(claude, [claude, *argv], account_env(DEFAULT))
     return cmd_run(argv)
 
 

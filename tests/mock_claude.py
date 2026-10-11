@@ -40,7 +40,7 @@ def main(argv):
         if argv[i] == "--":
             break
         i += 1
-    account = os.environ["CLAUDE_ROTATE_ACCOUNT"]
+    account = os.environ.get("CLAUDE_ROTATE_ACCOUNT", "no-wrapper")
     with open(os.environ["MOCK_LOG"], "a") as f:
         f.write(json.dumps({"argv": argv, "account": account, "cwd": os.getcwd()}) + "\n")
 
