@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""Run Claude Code and move to the next account when the current one hits its usage limit.
+
+Each extra account has its own CLAUDE_CONFIG_DIR (~/.claude-accounts/accounts/<name>) holding only
+that account's private state: .claude.json, backups and caches. Its sign-in lives in the keychain
+entry Claude Code derives from that directory. Every other entry is a symlink into ~/.claude, so
+settings, CLAUDE.md, skills, plugins, memory and session transcripts are shared and
+`claude --resume <id>` works on any account. The account "default" is the normal login
+(no CLAUDE_CONFIG_DIR).
+
+Two hooks are passed with --settings, so ~/.claude/settings.json is not touched: SessionStart tells
+the wrapper the session id, and StopFailure (error "rate_limit") asks it to stop claude when
+another account is free. After claude exits, the wrapper reads the transcript: when the last
+message is the usage-limit error it records the account as limited until the reset time in that
+message and starts claude again on the next free account with
+`--resume <session> -- <continue prompt>`. A --print run is moved the same way after it exits.
+
+usage:
+  claude-rotate [claude args...]              run claude on the first account that is not limited
+  claude-rotate account add NAME [--email E] [--no-login]
+  claude-rotate account login NAME [--email E]
+  claude-rotate account list
+  claude-rotate account reset [NAME]          forget recorded limits
+  claude-rotate account help                  print this text
+
+Environment: CLAUDE_ROTATE_HOME (default ~/.claude-accounts), CLAUDE_ROTATE_SHARED_DIR (default
+~/.claude), CLAUDE_ROTATE_CLAUDE_BIN (default: the first `claude` on PATH that is not this file).
+Requires Python 3.9+ on macOS or Linux. `claude --bare` skips --settings hooks, so an interactive
+session started with it is not moved while it runs; a --print run still is, after it exits.
+"""
+
+import fcntl
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+HOME = Path(os.environ.get("CLAUDE_ROTATE_HOME", "~/.claude-accounts")).expanduser()
+SHARED = Path(os.environ.get("CLAUDE_ROTATE_SHARED_DIR", "~/.claude")).expanduser()
+SHARED_IS_DEFAULT = SHARED.resolve() == Path("~/.claude").expanduser().resolve()
+ACCOUNTS = HOME / "accounts"
+RUNS = HOME / "runs"
+CONFIG = HOME / "config.json"
+STATE = HOME / "state.json"
+SELF = os.path.realpath(__file__)
+DEFAULT = "default"
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+# Config-dir entries that belong to one account and are never linked to the shared dir.
+PRIVATE = {
+    ".claude.json", ".claude.json.backup", ".credentials.json", "backups", "cache", "statsig",
+    "state", "telemetry", "policy-limits.json", "remote-settings.json", "mcp-needs-auth-cache.json",
+    ".last-cleanup", ".last-update-result.json",
+}
+# Session data directories created in the shared dir before linking, so Claude Code never creates
+# an account-local one first (a resumed session needs its transcript and file history).
+SESSION_DIRS = [
+    "projects", "file-history", "todos", "plans", "tasks", "session-env", "shell-snapshots",
+    "paste-cache", "sessions",
+]
+# Global-config keys copied from the main login when an account is created.
+SEED_KEYS = [
+    "hasCompletedOnboarding", "lastOnboardingVersion", "theme", "installMethod", "autoUpdates",
+    "autoUpdatesProtectedForNative", "editorMode",
+]
+# Per-project keys copied from the main login before every launch, so a resumed session does not
+# stop at the trust dialog or lose local-scope MCP servers.
+PROJECT_KEYS = [
+    "hasTrustDialogAccepted", "hasClaudeMdExternalIncludesApproved",
+    "hasClaudeMdExternalIncludesWarningShown", "allowedTools", "mcpServers",
+    "enabledMcpjsonServers", "disabledMcpjsonServers",
+]
+DEFAULTS = {
+    "order": [DEFAULT],
+    "cooldown_minutes": 60,
+    "continue_prompt": (
+        "The previous turn stopped because the account hit its usage limit, and this session was "
+        "resumed on another account. Continue where you left off."
+    ),
+}
+
+# claude flags that take a value (`claude --help`, 2.1.288). "one": the next token; "optional": the
+# next token unless it starts with "-"; "variadic": every token up to the next flag.
+VALUE_FLAGS = {
+    **dict.fromkeys([
+        "--agent", "--agents", "--append-system-prompt", "--append-system-prompt-file",
+        "--autocompact", "--debug-file", "--effort", "--environment", "--fallback-model",
+        "--input-format", "--json-schema", "--max-budget-usd", "--max-turns", "--model", "-n",
+        "--name", "--output-format", "--permission-mode", "--permission-prompt-tool",
+        "--permission-prompts", "--plugin-dir", "--plugin-url",
+        "--remote-control-session-name-prefix", "--session-id", "--setting-sources", "--settings",
+        "--system-prompt", "--system-prompt-file", "--system-prompt-snapshot",
+    ], "one"),
+    **dict.fromkeys([
+        "--add-dir", "--allowedTools", "--allowed-tools", "--betas", "--disallowedTools",
+        "--disallowed-tools", "--file", "--mcp-config", "--tools",
+    ], "variadic"),
+    **dict.fromkeys([
+        "--cloud", "-d", "--debug", "--from-pr", "--prompt-suggestions", "--remote-control", "-r",
+        "--resume", "--teleport", "-w", "--worktree",
+    ], "optional"),
+}
+# Flags that choose or create the conversation; the wrapper drops them when it resumes a session.
+SESSION_FLAGS = {
+    "-c", "--continue", "-r", "--resume", "--session-id", "--fork-session", "--from-pr",
+    "--teleport", "--cloud", "-w", "--worktree", "--tmux",
+}
+
+
+def info(msg):
+    print(f"[claude-rotate] {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg):
+    info(msg)
+    sys.exit(2)
+
+
+def read_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path, data, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def load_config():
+    return {**DEFAULTS, **read_json(CONFIG, {})}
+
+
+def save_config(cfg):
+    write_json(CONFIG, cfg, mode=0o644)
+
+
+def with_state(fn):
+    """Read-modify-write state.json under a lock; returns fn(state)."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    with open(HOME / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_json(STATE, {})
+        result = fn(state)
+        write_json(STATE, state)
+        return result
+
+
+def main_json():
+    """The global config of the default login, where Claude Code itself looks for it."""
+    return Path("~/.claude.json").expanduser() if SHARED_IS_DEFAULT else SHARED / ".claude.json"
+
+
+def account_json(name):
+    return main_json() if name == DEFAULT else ACCOUNTS / name / ".claude.json"
+
+
+def account_env(name):
+    env = dict(os.environ)
+    if name != DEFAULT:
+        env["CLAUDE_CONFIG_DIR"] = str(ACCOUNTS / name)
+    elif SHARED_IS_DEFAULT:
+        # Setting CLAUDE_CONFIG_DIR=~/.claude explicitly would select a different keychain entry.
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(SHARED)
+    return env
+
+
+def account_email(name):
+    return (read_json(account_json(name), {}).get("oauthAccount") or {}).get("emailAddress")
+
+
+def find_claude():
+    if os.environ.get("CLAUDE_ROTATE_CLAUDE_BIN"):
+        return os.environ["CLAUDE_ROTATE_CLAUDE_BIN"]
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = os.path.join(d, "claude")
+        if os.access(p, os.X_OK) and os.path.realpath(p) != SELF:
+            return p
+    die("claude not found on PATH")
+
+
+# ---------------------------------------------------------------- account directories
+
+def link_shared(name):
+    d = ACCOUNTS / name
+    for n in SESSION_DIRS:
+        (SHARED / n).mkdir(exist_ok=True)
+    for entry in sorted(SHARED.iterdir()):
+        if entry.name in PRIVATE:
+            continue
+        link = d / entry.name
+        if link.is_symlink():
+            continue
+        if link.exists():
+            info(f"{link} is a separate copy, not a link to {entry}; changes there are not shared. "
+                 f"Merge it into {entry} and delete it to share it again.")
+            continue
+        link.symlink_to(entry)
+
+
+def sync_global_config(name, prev):
+    """Copy MCP servers and per-project trust from the main login (and the previous account)."""
+    path = account_json(name)
+    data = read_json(path, {})
+    before = json.dumps(data, sort_keys=True)
+    main = read_json(main_json(), {})
+    if "mcpServers" in main:
+        data["mcpServers"] = main["mcpServers"]
+    projects = data.setdefault("projects", {})
+    for p, entry in (main.get("projects") or {}).items():
+        dst = projects.setdefault(p, {})
+        dst.update({k: entry[k] for k in PROJECT_KEYS if k in entry})
+    if prev and prev != name:
+        for p, entry in (read_json(account_json(prev), {}).get("projects") or {}).items():
+            if entry.get("hasTrustDialogAccepted"):
+                projects.setdefault(p, {})["hasTrustDialogAccepted"] = True
+    if json.dumps(data, sort_keys=True) != before:
+        write_json(path, data)
+
+
+def prepare_account(name, prev=None):
+    if name == DEFAULT:
+        return
+    if not (ACCOUNTS / name).is_dir():
+        die(f"account {name} has no directory {ACCOUNTS / name}; run `claude-rotate account add {name}`")
+    link_shared(name)
+    sync_global_config(name, prev)
+
+
+# ---------------------------------------------------------------- limits
+
+RESET_ISO_RE = re.compile(r"resets\s+(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})\s*(UTC|Z)?", re.I)
+RESET_CLOCK_RE = re.compile(
+    r"resets\s+(?:(?P<mon>[A-Za-z]{3})[a-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?:at\s+)?)?"
+    r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>[ap]\.?m\.?)?(?:\s*\((?P<tz>[^)]+)\))?",
+    re.I,
+)
+
+
+def parse_reset(text, now):
+    """Epoch seconds of the reset in a limit message such as "· resets 3pm (Asia/Seoul)", or None."""
+    m = RESET_ISO_RE.search(text)
+    if m:
+        tz = ZoneInfo("UTC") if m.group(4) else datetime.now().astimezone().tzinfo
+        dt = datetime.strptime(f"{m.group(1)} {m.group(2)}:{m.group(3)}", "%Y-%m-%d %H:%M")
+        return dt.replace(tzinfo=tz).timestamp()
+    m = RESET_CLOCK_RE.search(text)
+    if not m or not (m.group("ap") or m.group("m")):
+        return None
+    try:
+        tz = ZoneInfo(m.group("tz")) if m.group("tz") else datetime.now().astimezone().tzinfo
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = datetime.now().astimezone().tzinfo
+    hour, minute = int(m.group("h")), int(m.group("m") or 0)
+    if m.group("ap"):
+        hour = hour % 12 + (12 if m.group("ap").lower().startswith("p") else 0)
+    if hour > 23 or minute > 59:
+        return None
+    current = datetime.fromtimestamp(now, tz)
+    if m.group("mon"):
+        try:
+            month = datetime.strptime(m.group("mon")[:3].title(), "%b").month
+            dt = current.replace(month=month, day=int(m.group("day")), hour=hour, minute=minute,
+                                 second=0, microsecond=0)
+        except ValueError:
+            return None
+        if dt < current - timedelta(days=1):
+            dt = dt.replace(year=dt.year + 1)
+    else:
+        dt = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if dt <= current:
+            dt += timedelta(days=1)
+    return dt.timestamp()
+
+
+def limited_until(state, name):
+    return (state.get(name) or {}).get("limited_until", 0)
+
+
+def usable(cfg):
+    return [a for a in cfg["order"] if a == DEFAULT or (ACCOUNTS / a).is_dir()] or [DEFAULT]
+
+
+def pick_first(cfg, state, now):
+    order = usable(cfg)
+    free = [a for a in order if limited_until(state, a) <= now]
+    if free:
+        return free[0]
+    soonest = min(order, key=lambda a: limited_until(state, a))
+    info(f"every account is limited; using {soonest}, which resets first "
+         f"({fmt_time(limited_until(state, soonest))})")
+    return soonest
+
+
+def pick_next(cfg, state, current, now):
+    order = usable(cfg)
+    start = order.index(current) + 1 if current in order else 0
+    for a in order[start:] + order[:start]:
+        if a != current and limited_until(state, a) <= now:
+            return a
+    return None
+
+
+def fmt_time(ts):
+    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
+
+def cmd_hook():
+    """SessionStart: tell the wrapper which session runs. StopFailure (rate_limit): ask the wrapper
+    to stop claude when another account is free. Claude Code may kill hooks still running when a
+    --print session exits, so the wrapper reads the limit itself from the transcript afterwards."""
+    payload = json.load(sys.stdin)
+    account, run = os.environ.get("CLAUDE_ROTATE_ACCOUNT"), os.environ.get("CLAUDE_ROTATE_RUN")
+    if not account or not run:
+        return 0
+    if payload.get("hook_event_name") == "SessionStart":
+        write_json(RUNS / f"{run}.session.json",
+                   {k: payload.get(k) for k in ("session_id", "transcript_path", "cwd")})
+    elif payload.get("error") == "rate_limit":
+        state = read_json(STATE, {})
+        state[account] = {"limited_until": float("inf")}
+        if pick_next(load_config(), state, account, time.time()):
+            (RUNS / f"{run}.stop").touch()
+    return 0
+
+
+def limit_message(transcript_path):
+    """Text of the usage-limit error when it is the last message of the transcript, else None."""
+    try:
+        lines = Path(transcript_path).read_text().splitlines()[-200:]
+    except (FileNotFoundError, TypeError):
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") not in ("user", "assistant") or entry.get("isSidechain"):
+            continue
+        if entry.get("isApiErrorMessage") and entry.get("error") == "rate_limit":
+            content = (entry.get("message") or {}).get("content") or []
+            return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+        return None
+    return None
+
+
+# ---------------------------------------------------------------- running claude
+
+def split_args(args):
+    """[(flag, tokens)] in order. flag is None for a positional token and "--" for the tail."""
+    parts, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            parts.append(("--", args[i:]))
+            break
+        if not a.startswith("-") or a == "-":
+            parts.append((None, [a]))
+            i += 1
+            continue
+        name, has_value = a.split("=", 1)[0], "=" in a
+        kind = None if has_value else VALUE_FLAGS.get(name)
+        j = i + 1
+        if kind == "one":
+            j = min(i + 2, len(args))
+        elif kind == "optional":
+            j += j < len(args) and not args[j].startswith("-")
+        elif kind == "variadic":
+            while j < len(args) and not args[j].startswith("-"):
+                j += 1
+        parts.append((name, args[i:j]))
+        i = j
+    return parts
+
+
+def hook_settings(parts):
+    """The --settings JSON: the user's own --settings (if any) plus this wrapper's hooks."""
+    settings = {}
+    for name, tokens in parts:
+        if name == "--settings":
+            value = tokens[0].split("=", 1)[1] if "=" in tokens[0] else tokens[1]
+            settings = json.loads(value) if value.lstrip().startswith("{") else read_json(
+                Path(value).expanduser(), {})
+    hook = {"type": "command", "timeout": 30,
+            "command": f"{shlex.quote(sys.executable)} {shlex.quote(SELF)} __hook"}
+    hooks = settings.setdefault("hooks", {})
+    hooks.setdefault("SessionStart", []).append({"hooks": [hook]})
+    hooks.setdefault("StopFailure", []).append({"matcher": "rate_limit", "hooks": [hook]})
+    return json.dumps(settings)
+
+
+def command_line(parts, settings):
+    head = [t for name, tokens in parts if name not in ("--", "--settings") for t in tokens]
+    tail = [t for name, tokens in parts if name == "--" for t in tokens]
+    return head + ["--settings", settings] + tail
+
+
+def resume_parts(parts, session_id, prompt):
+    kept = [(n, t) for n, t in parts if n is not None and n != "--" and n not in SESSION_FLAGS]
+    return kept + [("--resume", ["--resume", session_id]), ("--", ["--", prompt])]
+
+
+def run_once(cmd, env, cwd, stop):
+    """Run claude in the foreground; end it once the StopFailure hook creates the stop file."""
+    proc = subprocess.Popen(cmd, env=env, cwd=cwd)
+    exited = threading.Event()
+
+    def watch():
+        while not exited.wait(0.3):
+            if stop.exists():
+                if exited.wait(1.0):  # let claude finish writing the turn
+                    return
+                try:
+                    os.kill(proc.pid, signal.SIGTERM)
+                    if not exited.wait(10):
+                        os.kill(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                return
+
+    def forward(sig, _frame):
+        try:
+            os.kill(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    # Ctrl-C and Ctrl-\ reach claude directly (same process group); the wrapper must survive them.
+    saved = {s: signal.signal(s, lambda *_: None) for s in (signal.SIGINT, signal.SIGQUIT)}
+    saved.update({s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGHUP)})
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        while True:
+            _, status = os.waitpid(proc.pid, os.WUNTRACED)
+            if os.WIFSTOPPED(status):  # claude suspended itself (Ctrl-Z): suspend with it
+                os.kill(os.getpid(), signal.SIGSTOP)
+                os.kill(proc.pid, signal.SIGCONT)
+                continue
+            break
+    finally:
+        exited.set()
+        for s, handler in saved.items():
+            signal.signal(s, handler)
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    return proc.returncode
+
+
+def cmd_run(args):
+    cfg, claude = load_config(), find_claude()
+    run = uuid.uuid4().hex
+    stop, session_file = RUNS / f"{run}.stop", RUNS / f"{run}.session.json"
+    parts = split_args(args)
+    settings = hook_settings(parts)
+    printing = any(name in ("-p", "--print") for name, _ in parts)
+    account = with_state(lambda state: pick_first(cfg, state, time.time()))
+    prev = cwd = None
+    try:
+        while True:
+            prepare_account(account, prev)
+            env = account_env(account)
+            env.update(CLAUDE_ROTATE_ACCOUNT=account, CLAUDE_ROTATE_RUN=run)
+            info(f"account {account} ({account_email(account) or 'not signed in'})")
+            code = run_once([claude, *command_line(parts, settings)], env, cwd, stop)
+            stopped = stop.exists()
+            stop.unlink(missing_ok=True)
+            session = read_json(session_file, None)
+            message = session and limit_message(session.get("transcript_path"))
+            if message is None:
+                return code
+            now = time.time()
+            until = parse_reset(message, now) or now + cfg["cooldown_minutes"] * 60
+
+            def record(state):
+                state[account] = {"limited_until": until, "message": message[:300], "recorded_at": now}
+                return pick_next(cfg, state, account, now)
+
+            nxt = with_state(record)
+            info(f"{account} hit its usage limit (free again around {fmt_time(until)})")
+            # An interactive session only moves when the hook stopped it; if the user quit, stay quit.
+            if not nxt or not (stopped or printing):
+                if not nxt:
+                    info("no other account is free")
+                return code
+            prev, account, cwd = account, nxt, session.get("cwd") or cwd
+            info(f"resuming session {session['session_id']} on {account}")
+            parts = resume_parts(parts, session["session_id"], cfg["continue_prompt"])
+    finally:
+        stop.unlink(missing_ok=True)
+        session_file.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- account commands
+
+def cmd_add(name, email, login):
+    if not NAME_RE.match(name) or name == DEFAULT:
+        die(f"account name must match {NAME_RE.pattern} and not be '{DEFAULT}'")
+    d = ACCOUNTS / name
+    if d.exists():
+        die(f"{d} already exists")
+    d.mkdir(parents=True)
+    main = read_json(main_json(), {})
+    write_json(d / ".claude.json", {k: main[k] for k in SEED_KEYS if k in main})
+    prepare_account(name)
+    cfg = load_config()
+    cfg["order"] = [*cfg["order"], name]
+    save_config(cfg)
+    info(f"added {name} ({d}); rotation order: {', '.join(cfg['order'])}")
+    if login:
+        return cmd_login(name, email)
+    return 0
+
+
+def cmd_login(name, email):
+    if name != DEFAULT:
+        prepare_account(name)
+    info("Sign in as the account to add. If the browser is signed in to a different claude.ai "
+         "account, open the login link in a private window.")
+    code = subprocess.call([find_claude(), "auth", "login", *(["--email", email] if email else [])],
+                           env=account_env(name))
+    info(f"{name}: {account_email(name) or 'not signed in'}")
+    return code
+
+
+def cmd_list():
+    cfg, state, now = load_config(), read_json(STATE, {}), time.time()
+    for name in cfg["order"]:
+        if name != DEFAULT and not (ACCOUNTS / name).is_dir():
+            status = "missing directory"
+        elif limited_until(state, name) > now:
+            status = f"limited until {fmt_time(limited_until(state, name))}"
+        else:
+            status = "available"
+        print(f"{name:<16} {account_email(name) or 'not signed in':<36} {status}")
+    return 0
+
+
+def cmd_reset(name):
+    with_state(lambda state: state.clear() if name is None else state.pop(name, None))
+    info(f"cleared recorded limits for {name or 'every account'}")
+    return 0
+
+
+def cmd_account(argv):
+    sub, rest = (argv[0], argv[1:]) if argv else ("list", [])
+    email = None
+    if "--email" in rest:
+        i = rest.index("--email")
+        email = rest[i + 1]
+        rest = rest[:i] + rest[i + 2:]
+    no_login = "--no-login" in rest
+    rest = [a for a in rest if a != "--no-login"]
+    if sub == "add" and len(rest) == 1:
+        return cmd_add(rest[0], email, not no_login)
+    if sub == "login" and len(rest) == 1:
+        return cmd_login(rest[0], email)
+    if sub == "list" and not rest:
+        return cmd_list()
+    if sub == "reset" and len(rest) <= 1:
+        return cmd_reset(rest[0] if rest else None)
+    print(__doc__, file=sys.stderr if sub != "help" else sys.stdout)
+    return 0 if sub == "help" else 2
+
+
+def main(argv):
+    if argv[:1] == ["__hook"]:
+        try:
+            return cmd_hook()
+        except Exception:  # Claude Code discards hook stderr; keep the trace where it can be read
+            import traceback
+            HOME.mkdir(parents=True, exist_ok=True)
+            with open(HOME / "hook-errors.log", "a") as f:
+                f.write(f"{datetime.now().isoformat()}\n{traceback.format_exc()}\n")
+            return 1
+    if argv[:1] == ["account"]:
+        return cmd_account(argv[1:])
+    return cmd_run(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
