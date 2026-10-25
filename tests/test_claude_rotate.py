@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "claude-rotate"
 MOCK = ROOT / "tests" / "mock_claude.py"
 LIMIT_TEXT = "You've hit your weekly limit · resets Oct 6 at 2am (Asia/Seoul)"
+FABLE_TEXT = "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."
 BANNER = "\r\n ⚠ \x1b[33mUsage limit reached\x1b[0m · limit resets 3:50pm · " \
          "\x1b]8;;https://clau.de/wrap-up\x1b\\clau.de/wrap-up\x1b]8;;\x1b\\\r\n"
 
@@ -120,6 +121,12 @@ class Helpers(unittest.TestCase):
         self.assertEqual(self.m.limit_message(t), "x\u20281\u2028" + LIMIT_TEXT)
         at = datetime(2026, 10, 25, 5, 40, tzinfo=ZoneInfo("UTC")).timestamp()
         self.assertEqual(self.m.scan_models(t, 0), ([], {"opus": at}))
+
+    def test_resume_parts_switches_model(self):
+        parts = self.m.split_args(["--model=fable", "-p", "hello"])
+        out = self.m.resume_parts(parts, "sid", "go on", "claude-opus-5-5")
+        self.assertEqual(out, [("-p", ["-p"]), ("--model", ["--model", "claude-opus-5-5"]),
+                              ("--resume", ["--resume", "sid"]), ("--", ["--", "go on"])])
 
     def test_pick_next_skips_limited(self):
         cfg = {"order": ["default", "a", "b"]}
@@ -301,11 +308,41 @@ class EndToEnd(unittest.TestCase):
 
     def test_rendered_hook_message_preserves_model_scope(self):
         r = self.rotate([], MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1",
-                        MOCK_LIMIT_TEXT="You've reached your Fable limit")
+                        MOCK_LIMIT_TEXT="You've reached your Sonnet limit")
         self.assertEqual(r.returncode, 0, r.stderr)
         entry = self.state()["default"]
         self.assertNotIn("limited_until", entry)
-        self.assertIn("fable", entry["models"])
+        self.assertIn("sonnet", entry["models"])
+        # Sonnet has no fallback model, so the session moves to an account where Sonnet is free.
+        self.assertEqual([i["account"] for i in self.invocations()], ["default", "dev"])
+
+    def test_fable_limit_resumes_same_account_on_opus(self):
+        r = self.rotate(["--model", "fable"], MOCK_LIMITED="default", MOCK_LIMIT_TEXT=FABLE_TEXT,
+                        MOCK_FREE_MODEL="claude-opus-5-5")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        inv = self.invocations()
+        self.assertEqual([i["account"] for i in inv], ["default", "default"])
+        second = inv[1]["argv"]
+        self.assertEqual(second.count("--model"), 1)
+        self.assertEqual(second[second.index("--model") + 1], "claude-opus-5-5")
+        transcripts = Path(self.tmp.name) / "transcripts"
+        sid = second[second.index("--resume") + 1]
+        self.assertEqual(list(transcripts.glob("*.jsonl")), [transcripts / f"{sid}.jsonl"])
+        prompt = second[second.index("--") + 1]
+        self.assertIn("Fable usage limit", prompt)
+        self.assertIn("resumed on claude-opus-5-5", prompt)
+        self.assertIn("with claude-opus-5-5", r.stderr)
+        self.assertIn("fable", self.state()["default"]["models"])
+
+    def test_subagent_fable_limit_leaves_parent_running(self):
+        r = self.rotate([], MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1",
+                        MOCK_SUBAGENT_LIMIT="1", MOCK_LIMIT_TEXT=FABLE_TEXT, MOCK_WAIT="0.5")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual([i["account"] for i in self.invocations()], ["default"])
+        self.assertIn("fable", self.state()["default"]["models"])
+        events = [json.loads(line) for line in (self.home / "events.jsonl").read_text().splitlines()]
+        self.assertIn("subagent_model_limit",
+                      [e.get("reason") for e in events if e["event"] == "rotation_skipped"])
 
     def test_hook_without_other_account_still_records_limit(self):
         cfg = json.loads((self.home / "config.json").read_text())

@@ -156,6 +156,12 @@ Model-specific errors (such as a Fable limit) mark only that model as limited, w
 without a recorded model limit. A subsequent successful model response clears an older model
 limit. Terminal banners without a model name are treated as account-wide limits.
 
+A session that hits a model limit listed in `model_fallbacks` (default
+`{"fable": "claude-opus-5-5"}`) is resumed on the same account with `--model <fallback>` and
+`model_switch_prompt`, replacing any `--model` you passed. A model with no fallback moves the
+session to the next account where that model is free. A subagent's limit on a model that has a
+fallback is recorded but does not restart the parent, whose own model is a separate choice.
+
 **Relaunch.** The original arguments are kept except anything that chooses a conversation
 (`-c`, `--resume`, `--session-id`, `--worktree`, positional prompt, ...), then
 `--resume <session> -- <continue_prompt>` is appended.
@@ -168,7 +174,8 @@ Files:
 
 ```
 ~/.claude-accounts/
-  config.json     order, cooldown_minutes, model_cooldown_hours, continue_prompt
+  config.json     order, cooldown_minutes, model_cooldown_hours, model_fallbacks,
+                  continue_prompt, model_switch_prompt
   state.json      per-account limited_until + the limit message
   accounts/<n>/   CLAUDE_CONFIG_DIR of each extra account
   runs/           per-launch session and limit evidence while a wrapper is running

@@ -16,10 +16,13 @@ After Claude exits, saved evidence (or a final transcript error) selects the nex
 resumes the parent with `--resume <session> -- <continue prompt>`.
 
 A limit that names one model ("You've reached your Fable limit") is recorded for that model only:
-the account stays usable, a session that hits it moves only to an account where that model is free,
-and new sessions prefer accounts with no model limit. Such messages carry no reset time, so the
-limit is assumed to last model_cooldown_hours, and it is dropped early once a transcript shows that
-model answering on the account again. Subagent transcripts are scanned for these limits on exit too.
+the account stays usable and new sessions prefer accounts with no model limit. A session that hits
+it is resumed on the same account with the model in model_fallbacks (Fable -> Opus 5.5); a model
+without a fallback moves the session to an account where that model is free. A subagent's limit on
+a model with a fallback is only recorded, since the parent's own model is unaffected. Such messages
+carry no reset time, so the limit is assumed to last model_cooldown_hours, and it is dropped early
+once a transcript shows that model answering on the account again. Subagent transcripts are scanned
+for these limits on exit too.
 
 usage:
   claude-rotate [claude args...]              run claude on the first account that is not limited
@@ -96,9 +99,14 @@ DEFAULTS = {
     "order": [DEFAULT],
     "cooldown_minutes": 60,
     "model_cooldown_hours": 24,
+    "model_fallbacks": {"fable": "claude-opus-5-5"},
     "continue_prompt": (
         "The previous turn stopped because the account hit its usage limit, and this session was "
         "resumed on another account. Continue where you left off."
+    ),
+    "model_switch_prompt": (
+        "The previous turn stopped because the account hit its {model} usage limit, and this "
+        "session was resumed on {fallback}. Continue where you left off."
     ),
 }
 
@@ -378,6 +386,16 @@ def pick_next(cfg, state, current, now, model=None):
     return None
 
 
+def switch_for(cfg, state, account, now, model):
+    """Where a session resumes after a limit: (account, model to switch to or None), or None.
+    A model limit with a fallback keeps the account; any other limit moves to the next free one."""
+    fallback = model and cfg["model_fallbacks"].get(model)
+    if fallback:
+        return account, fallback
+    nxt = pick_next(cfg, state, account, now, model)
+    return (nxt, None) if nxt else None
+
+
 def fmt_time(ts):
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
 
@@ -393,7 +411,8 @@ def log_event(run, account, event, **fields):
 
 
 def signal_limit(account, run, message, source):
-    """Persist evidence before asking the parent to stop. First signal per launch wins."""
+    """Persist evidence before asking the parent to stop. First signal per launch wins, except that
+    a subagent's limit on a model with a fallback is only recorded and leaves the parent running."""
     RUNS.mkdir(parents=True, exist_ok=True)
     with open(RUNS / f"{run}.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -404,16 +423,20 @@ def signal_limit(account, run, message, source):
 
         def record(state):
             model, until = record_limit(state, account, message, now, cfg)
-            return model, until, pick_next(cfg, state, account, now, model)
+            return model, until, switch_for(cfg, state, account, now, model)
 
-        model, until, nxt = with_state(record)
+        model, until, target = with_state(record)
+        session = read_json(RUNS / f"{run}.session.json", {})
+        log_event(run, account, "limit_detected", source=source, model=model,
+                  limited_until=until, session_id=session.get("session_id"),
+                  next_account=target and target[0], next_model=target and target[1])
+        if target and target[1] and source == "SubagentStop":
+            log_event(run, account, "rotation_skipped", reason="subagent_model_limit")
+            return
         evidence = {"account": account, "message": message[:1000], "source": source,
                     "recorded_at": now, "model": model, "limited_until": until}
         write_json(evidence_file, evidence)
-        session = read_json(RUNS / f"{run}.session.json", {})
-        log_event(run, account, "limit_detected", source=source, model=model,
-                  limited_until=until, session_id=session.get("session_id"), next_account=nxt)
-        if nxt and session.get("session_id"):
+        if target and session.get("session_id"):
             (RUNS / f"{run}.stop").touch()
         elif not session.get("session_id"):
             log_event(run, account, "rotation_skipped", reason="missing_session")
@@ -579,8 +602,11 @@ def command_line(parts, settings):
     return head + ["--settings", settings] + tail
 
 
-def resume_parts(parts, session_id, prompt):
-    kept = [(n, t) for n, t in parts if n is not None and n != "--" and n not in SESSION_FLAGS]
+def resume_parts(parts, session_id, prompt, model=None):
+    drop = SESSION_FLAGS | ({"--model"} if model else set())
+    kept = [(n, t) for n, t in parts if n is not None and n != "--" and n not in drop]
+    if model:
+        kept.append(("--model", ["--model", model]))
     return kept + [("--resume", ["--resume", session_id]), ("--", ["--", prompt])]
 
 
@@ -832,23 +858,26 @@ def cmd_run(args):
                     model, until = evidence["model"], evidence["limited_until"]
                 else:
                     model, until = record_limit(state, account, message, now, cfg)
-                return model, until, pick_next(cfg, state, account, now, model)
+                return model, until, switch_for(cfg, state, account, now, model)
 
-            model, until, nxt = with_state(record)
+            model, until, target = with_state(record)
             info(f"{account} hit its {model.title() + ' ' if model else 'usage '}limit "
                  f"(free again around {fmt_time(until)})")
             # Explicit termination must not restart the user's session.
-            if cancelled or not session or not nxt or not (stopped or printing):
-                if not nxt:
+            if cancelled or not session or not target or not (stopped or printing):
+                if not target:
                     info("no other account is free")
                 log_event(run, account, "rotation_skipped",
                           reason="cancelled" if cancelled else "missing_session" if not session
-                          else "no_free_account" if not nxt else "user_exit")
+                          else "no_free_account" if not target else "user_exit")
                 return code
+            (nxt, switch), sid = target, session["session_id"]
             prev, account, cwd = account, nxt, session.get("cwd") or cwd
-            info(f"resuming session {session['session_id']} on {account}")
-            log_event(run, prev, "resuming", session_id=session["session_id"], next_account=account)
-            parts = resume_parts(parts, session["session_id"], cfg["continue_prompt"])
+            info(f"resuming session {sid} on {account}" + (f" with {switch}" if switch else ""))
+            log_event(run, prev, "resuming", session_id=sid, next_account=account, next_model=switch)
+            prompt = (cfg["model_switch_prompt"].format(model=model.title(), fallback=switch)
+                      if switch else cfg["continue_prompt"])
+            parts = resume_parts(parts, sid, prompt, switch)
         finally:
             for suffix in (".stop", ".session.json", ".limit.json", ".lock"):
                 (RUNS / f"{run}{suffix}").unlink(missing_ok=True)
