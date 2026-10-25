@@ -141,6 +141,40 @@ class Helpers(unittest.TestCase):
         self.assertIsNone(self.m.switch_for(cfg, state, "default", 0, "fable"))
         self.assertEqual(self.m.switch_for(cfg, {}, "default", 0, "sonnet"), ("a", None))
 
+    def test_scan_models_reads_subagent_transcripts(self):
+        t = Path(self.tmp.name) / "parent.jsonl"
+        agents = t.with_suffix("") / "subagents"
+        agents.mkdir(parents=True)
+        t.write_text(json.dumps({"type": "assistant", "timestamp": "2026-10-25T05:00:00Z",
+                                 "message": {"model": "claude-opus-5-5", "content": []}}) + "\n")
+        (agents / "agent-a.jsonl").write_text(json.dumps({
+            "type": "assistant", "isSidechain": True, "isApiErrorMessage": True, "error": "rate_limit",
+            "timestamp": "2026-10-25T05:01:00Z",
+            "message": {"model": "<synthetic>", "content": [{"type": "text", "text": FABLE_TEXT}]},
+        }) + "\n")
+        limits, replied = self.m.scan_models(t, 0)
+        self.assertEqual([(model, text) for model, text, _ in limits], [("fable", FABLE_TEXT)])
+        self.assertEqual(list(replied), ["opus"])
+
+    def test_note_models_clears_limit_after_a_later_reply(self):
+        t = Path(self.tmp.name) / "later.jsonl"
+        t.write_text(json.dumps({"type": "assistant", "timestamp": "2026-10-25T06:00:00Z",
+                                 "message": {"model": "claude-fable-5-1", "content": []}}) + "\n")
+        reply = datetime(2026, 10, 25, 6, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+        state = {"default": {"models": {"fable": {"limited_until": 10**12, "recorded_at": reply - 60}}}}
+        self.m.note_models(state, "default", t, 0, {"model_cooldown_hours": 24})
+        self.assertEqual(state["default"]["models"], {})
+
+    def test_model_limits_steer_account_choice(self):
+        cfg = {"order": ["default", "a", "b"]}
+        for name in ("a", "b"):
+            (self.m.ACCOUNTS / name).mkdir(parents=True, exist_ok=True)
+        fable = {"models": {"fable": {"limited_until": 10**12}}}
+        state = {"default": fable, "a": fable}
+        self.assertEqual(self.m.pick_next(cfg, state, "default", 0, "fable"), "b")
+        self.assertEqual(self.m.pick_next(cfg, state, "default", 0), "a")
+        self.assertEqual(self.m.pick_first(cfg, state, 0), "b")
+
     def test_pick_next_skips_limited(self):
         cfg = {"order": ["default", "a", "b"]}
         (self.m.ACCOUNTS / "a").mkdir(parents=True, exist_ok=True)
