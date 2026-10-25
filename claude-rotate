@@ -348,10 +348,16 @@ def cmd_hook():
     return 0
 
 
+def read_lines(path):
+    """A JSONL file's lines. Not str.splitlines(): that also splits at U+2028 and other separators
+    that JSON keeps unescaped inside strings (tool output does contain them)."""
+    return Path(path).read_text().split("\n")
+
+
 def limit_message(transcript_path):
     """Text of the usage-limit error when it is the last message of the transcript, else None."""
     try:
-        lines = Path(transcript_path).read_text().splitlines()[-200:]
+        lines = read_lines(transcript_path)[-200:]
     except (FileNotFoundError, TypeError):
         return None
     for line in reversed(lines):
@@ -359,7 +365,8 @@ def limit_message(transcript_path):
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if entry.get("type") not in ("user", "assistant") or entry.get("isSidechain"):
+        if (not isinstance(entry, dict) or entry.get("type") not in ("user", "assistant")
+                or entry.get("isSidechain")):
             continue
         if entry.get("isApiErrorMessage") and entry.get("error") == "rate_limit":
             content = (entry.get("message") or {}).get("content") or []
