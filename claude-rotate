@@ -13,6 +13,12 @@ the wrapper the parent session id; StopFailure and SubagentStop persist quota er
 switch when another account is free. After Claude exits, saved evidence (or a final transcript
 error) selects the next account and resumes the parent with `--resume <session> -- <continue prompt>`.
 
+A limit that names one model ("You've reached your Fable limit") is recorded for that model only:
+the account stays usable, a session that hits it moves only to an account where that model is free,
+and new sessions prefer accounts with no model limit. Such messages carry no reset time, so the
+limit is assumed to last model_cooldown_hours, and it is dropped early once a transcript shows that
+model answering on the account again. Subagent transcripts are scanned for these limits on exit too.
+
 usage:
   claude-rotate [claude args...]              run claude on the first account that is not limited
   claude-rotate account add NAME [--email E] [--no-login]
@@ -81,6 +87,7 @@ PROJECT_KEYS = [
 DEFAULTS = {
     "order": [DEFAULT],
     "cooldown_minutes": 60,
+    "model_cooldown_hours": 24,
     "continue_prompt": (
         "The previous turn stopped because the account hit its usage limit, and this session was "
         "resumed on another account. Continue where you left off."
@@ -295,15 +302,45 @@ def parse_reset(text, now):
     return dt.timestamp()
 
 
+MODEL_LIMIT_RE = re.compile(r"\b(?:reached your|keep using)\s+(Fable|Opus|Sonnet|Haiku)\b", re.I)
+
+
+def limited_model(message):
+    """The model family a usage-limit message is scoped to ("fable"), or None for the whole account."""
+    m = MODEL_LIMIT_RE.search(message or "")
+    return m.group(1).lower() if m else None
+
+
 def limited_until(state, name):
     return (state.get(name) or {}).get("limited_until", 0)
 
 
-def record_limit(state, account, message, now, cfg):
-    """Record a usage-limit message for the account. Returns the time it is free again."""
-    until = parse_reset(message, now) or now + cfg["cooldown_minutes"] * 60
-    state[account] = {"limited_until": until, "message": message[:300], "recorded_at": now}
-    return until
+def model_limits(state, name):
+    return (state.get(name) or {}).get("models") or {}
+
+
+def model_limited_until(state, name, model):
+    return (model_limits(state, name).get(model) or {}).get("limited_until", 0)
+
+
+def active_models(state, name, now):
+    return sorted(m for m, e in model_limits(state, name).items() if e.get("limited_until", 0) > now)
+
+
+def record_limit(state, account, message, now, cfg, at=None):
+    """Record a usage-limit message seen at `at` (default now). Returns (model or None, until)."""
+    at = at or now
+    model = limited_model(message)
+    reset = parse_reset(message, at)
+    entry = {"message": message[:300], "recorded_at": at}
+    current = state.setdefault(account, {})
+    if model:
+        entry["limited_until"] = reset or at + cfg["model_cooldown_hours"] * 3600
+        current.setdefault("models", {})[model] = entry
+    else:
+        entry["limited_until"] = reset or at + cfg["cooldown_minutes"] * 60
+        current.update(entry)
+    return model, entry["limited_until"]
 
 
 def usable(cfg):
@@ -314,18 +351,21 @@ def pick_first(cfg, state, now):
     order = usable(cfg)
     free = [a for a in order if limited_until(state, a) <= now]
     if free:
-        return free[0]
+        # Prefer an account where no model is limited, so subagents on that model keep working.
+        return min(free, key=lambda a: bool(active_models(state, a, now)))
     soonest = min(order, key=lambda a: limited_until(state, a))
     info(f"every account is limited; using {soonest}, which resets first "
          f"({fmt_time(limited_until(state, soonest))})")
     return soonest
 
 
-def pick_next(cfg, state, current, now):
+def pick_next(cfg, state, current, now, model=None):
+    """The next account that is not limited (and, for a model-scoped limit, has that model free)."""
     order = usable(cfg)
     start = order.index(current) + 1 if current in order else 0
     for a in order[start:] + order[:start]:
-        if a != current and limited_until(state, a) <= now:
+        if a != current and limited_until(state, a) <= now and (
+                not model or model_limited_until(state, a, model) <= now):
             return a
     return None
 
@@ -355,15 +395,15 @@ def signal_limit(account, run, message, source):
         now, cfg = time.time(), load_config()
 
         def record(state):
-            until = record_limit(state, account, message, now, cfg)
-            return until, pick_next(cfg, state, account, now)
+            model, until = record_limit(state, account, message, now, cfg)
+            return model, until, pick_next(cfg, state, account, now, model)
 
-        until, nxt = with_state(record)
+        model, until, nxt = with_state(record)
         evidence = {"account": account, "message": message[:1000], "source": source,
-                    "recorded_at": now, "limited_until": until}
+                    "recorded_at": now, "model": model, "limited_until": until}
         write_json(evidence_file, evidence)
         session = read_json(RUNS / f"{run}.session.json", {})
-        log_event(run, account, "limit_detected", source=source,
+        log_event(run, account, "limit_detected", source=source, model=model,
                   limited_until=until, session_id=session.get("session_id"), next_account=nxt)
         if nxt and session.get("session_id"):
             (RUNS / f"{run}.stop").touch()
@@ -388,7 +428,7 @@ def cmd_hook():
         if message:
             signal_limit(account, run, message, "SubagentStop")
     elif event == "StopFailure" and payload.get("error") == "rate_limit":
-        # error_details is often just "429". The rendered message contains the reset time.
+        # error_details is often just "429". The rendered message contains the model/reset.
         message = str(payload.get("last_assistant_message") or payload.get("error_details")
                       or "Rate limit reached")
         signal_limit(account, run, message, "StopFailure")
@@ -421,6 +461,62 @@ def limit_message(transcript_path, sidechain=False):
             return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
         return None
     return None
+
+
+def entry_time(entry):
+    try:
+        return datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, AttributeError, ValueError):
+        return None
+
+
+def scan_models(transcript_path, since):
+    """Model evidence since `since` in a session transcript and its subagents' transcripts:
+    ([(model, message, time)] model-scoped limit errors, {model: time of its last reply})."""
+    limits, replied = [], {}
+    if not transcript_path:
+        return limits, replied
+    path = Path(transcript_path)
+    for f in [path, *sorted((path.with_suffix("") / "subagents").glob("*.jsonl"))]:
+        try:
+            if f.stat().st_mtime < since:
+                continue
+            lines = read_lines(f)
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict) or entry.get("type") != "assistant":
+                continue
+            at = entry_time(entry)
+            if at is None or at < since:
+                continue
+            message = entry.get("message") or {}
+            if entry.get("isApiErrorMessage"):
+                text = " ".join(c.get("text", "") for c in message.get("content") or []
+                                if isinstance(c, dict))
+                model = entry.get("error") == "rate_limit" and limited_model(text)
+                if model:
+                    limits.append((model, text, at))
+            else:
+                m = re.match(r"claude-([a-z]+)", message.get("model") or "")
+                if m:
+                    replied[m.group(1)] = max(replied.get(m.group(1), 0), at)
+    return limits, replied
+
+
+def note_models(state, account, transcript_path, since, cfg):
+    """Drop model limits the transcripts disprove; record model limits that subagents hit."""
+    limits, replied = scan_models(transcript_path, since)
+    models = model_limits(state, account)
+    for model in [m for m, e in models.items() if replied.get(m, 0) > e.get("recorded_at", 0)]:
+        del models[model]
+    for model, text, at in sorted(limits, key=lambda limit: limit[2]):
+        if replied.get(model, 0) <= at:
+            record_limit(state, account, text, time.time(), cfg, at=at)
 
 
 # ---------------------------------------------------------------- running claude
@@ -543,10 +639,14 @@ def cmd_run(args):
             env = account_env(account)
             env.update(CLAUDE_ROTATE_ACCOUNT=account, CLAUDE_ROTATE_RUN=run)
             info(f"account {account} ({account_email(account) or 'not signed in'})")
+            started = time.time()
             code, cancelled = run_once([claude, *command_line(parts, settings)], env, cwd, stop)
             stopped = stop.exists()
             stop.unlink(missing_ok=True)
             session = read_json(session_file, None)
+            if session:
+                with_state(lambda state: note_models(
+                    state, account, session.get("transcript_path"), started, cfg))
             evidence = read_json(RUNS / f"{run}.limit.json", None)
             message = evidence["message"] if evidence else session and limit_message(session.get("transcript_path"))
             if message is None:
@@ -554,12 +654,15 @@ def cmd_run(args):
             now = time.time()
 
             def record(state):
-                until = evidence["limited_until"] if evidence else record_limit(
-                    state, account, message, now, cfg)
-                return until, pick_next(cfg, state, account, now)
+                if evidence:
+                    model, until = evidence["model"], evidence["limited_until"]
+                else:
+                    model, until = record_limit(state, account, message, now, cfg)
+                return model, until, pick_next(cfg, state, account, now, model)
 
-            until, nxt = with_state(record)
-            info(f"{account} hit its usage limit (free again around {fmt_time(until)})")
+            model, until, nxt = with_state(record)
+            info(f"{account} hit its {model.title() + ' ' if model else 'usage '}limit "
+                 f"(free again around {fmt_time(until)})")
             # Explicit termination must not restart the user's session.
             if cancelled or not session or not nxt or not (stopped or printing):
                 if not nxt:
@@ -618,6 +721,8 @@ def cmd_list():
             status = f"limited until {fmt_time(limited_until(state, name))}"
         else:
             status = "available"
+        for model in active_models(state, name, now):
+            status += f"; {model} limited until {fmt_time(model_limited_until(state, name, model))}"
         print(f"{name:<16} {account_email(name) or 'not signed in':<36} {status}")
     return 0
 
