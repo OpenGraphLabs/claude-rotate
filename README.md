@@ -11,7 +11,7 @@ the conversation over. `claude-rotate` is a single-file Python wrapper that:
 - keeps each extra account in its own `CLAUDE_CONFIG_DIR` while sharing settings, `CLAUDE.md`,
   skills, plugins, memory and session transcripts with your main login;
 - starts `claude` on the first account that is not limited;
-- notices the usage-limit error (through a `StopFailure` hook and the session transcript),
+- notices usage limits through main/subagent error hooks and the session transcript,
   records when that account resets, and relaunches `claude --resume <session>` on the next free
   account with a short "continue where you left off" prompt;
 - does the same for `claude -p` (print mode) runs after they exit.
@@ -126,17 +126,22 @@ from the config dir, so each directory gets its own login. On every launch the w
 MCP servers and per-project trust from the main login into the account's `.claude.json`, so a
 resumed session does not stop at the trust dialog.
 
-**Detection.** Two hooks are passed with `--settings` (your own `--settings` is merged, your
-`settings.json` is untouched): `SessionStart` records the session id and transcript path, and
-`StopFailure` with matcher `rate_limit` asks the wrapper to stop `claude` once another account is
-free. After `claude` exits, the wrapper reads the transcript tail; if the last message is the
-usage-limit error (`isApiErrorMessage` with `error: "rate_limit"`), it parses the reset time from
-the text (`resets 3pm (Asia/Seoul)`, `resets Oct 6 at 2am (Asia/Seoul)`, or an ISO time) and
-falls back to `cooldown_minutes` (default 60) when it cannot.
+**Detection.** Three hooks are passed with `--settings` (your own `--settings` is merged, your
+`settings.json` is untouched). `SessionStart` records the parent session id and transcript path.
+`StopFailure` with matcher `rate_limit`, or a `SubagentStop` whose transcript ends in a rate-limit
+error, saves the error before asking the wrapper to stop Claude when another account is free.
+Saved hook evidence is sufficient to rotate even when the main transcript has no error.
+After exit, the last transcript message remains a secondary source of evidence for print runs
+whose hooks did not finish. The reset time is parsed from the message; when absent,
+`cooldown_minutes` (default 60) applies.
 
 **Relaunch.** The original arguments are kept except anything that chooses a conversation
 (`-c`, `--resume`, `--session-id`, `--worktree`, positional prompt, ...), then
 `--resume <session> -- <continue_prompt>` is appended.
+The resumed session is the parent, not the subagent that hit a limit. Interrupted background
+work may need to be restarted by that parent; rotation does not preserve live child processes.
+Every account launch gets a different run id so a late hook cannot stop the new account's run.
+If no alternative is free, the limit is still recorded and Claude is left running.
 
 Files:
 
@@ -145,7 +150,9 @@ Files:
   config.json     order, cooldown_minutes, continue_prompt
   state.json      per-account limited_until + the limit message
   accounts/<n>/   CLAUDE_CONFIG_DIR of each extra account
-  runs/           per-run session info while a wrapper is running
+  runs/           per-launch session and limit evidence while a wrapper is running
+  events.jsonl    session start, limit source, selection and resume/skip diagnostics
+  hook-errors.log hook exceptions, if any
 ```
 
 Environment variables: `CLAUDE_ROTATE_HOME` (default `~/.claude-accounts`),
@@ -158,6 +165,7 @@ Environment variables: `CLAUDE_ROTATE_HOME` (default `~/.claude-accounts`),
 - Rotation is per wrapper process. Several sessions running at once each move on their own; the
   recorded limit in `state.json` is shared so later launches start on a free account.
 - Ctrl-C, Ctrl-\ and Ctrl-Z go to `claude`; the wrapper survives them.
+- An external SIGTERM/SIGHUP is forwarded and never causes an automatic relaunch.
 - Not tested on Windows (uses `fcntl` and POSIX signals).
 
 ## Development
