@@ -670,6 +670,26 @@ class TerminalLimitDetector:
         return None
 
 
+def banner_quoted(transcript_path, since):
+    """True when a message since `since` contains the banner's help link: Claude, a tool or the user
+    printed the banner text, so the terminal showed conversation content, not Claude's notice."""
+    try:
+        lines = read_lines(transcript_path)
+    except (OSError, TypeError):
+        return False
+    for line in lines:
+        if "clau.de/wrap-up" not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(entry, dict) and entry.get("type") in ("user", "assistant")
+                and not entry.get("isApiErrorMessage") and (entry_time(entry) or 0) >= since):
+            return True
+    return False
+
+
 def run_terminal(cmd, env, cwd, stop):
     """Proxy the interactive terminal so quota notices without hooks are observable."""
     input_fd, output_fd = sys.stdin.fileno(), sys.stdout.fileno()
@@ -686,8 +706,10 @@ def run_terminal(cmd, env, cwd, stop):
             os._exit(127)
     detector = TerminalLimitDetector()
     account, run = env["CLAUDE_ROTATE_ACCOUNT"], env["CLAUDE_ROTATE_RUN"]
+    started = time.time()
     cancelled = False
-    pending = None
+    pending = pending_at = None
+    last_output = time.monotonic()
     stop_at = None
     term_at = None
     status = None
@@ -712,6 +734,15 @@ def run_terminal(cmd, env, cwd, stop):
         while data:
             data = data[os.write(fd, data):]
 
+    def confirm(message):
+        nonlocal detector
+        transcript = read_json(RUNS / f"{run}.session.json", {}).get("transcript_path")
+        if banner_quoted(transcript, started):
+            log_event(run, account, "banner_ignored", reason="quoted_in_conversation")
+            detector = TerminalLimitDetector()
+        else:
+            signal_limit(account, run, message, "terminal_banner")
+
     saved = {s: signal.signal(s, forward)
              for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT)}
     saved[signal.SIGWINCH] = signal.signal(signal.SIGWINCH, resize)
@@ -729,10 +760,12 @@ def run_terminal(cmd, env, cwd, stop):
                 else:
                     status = child_status
                     break
-            if pending and read_json(RUNS / f"{run}.session.json", {}).get("session_id"):
-                signal_limit(account, run, pending, "terminal_banner")
-                pending = None
             now = time.monotonic()
+            # Confirm once Claude is idle, so a reply that quotes the banner is in the transcript.
+            if pending and (now - last_output >= 2 or now - pending_at >= 30) and read_json(
+                    RUNS / f"{run}.session.json", {}).get("session_id"):
+                confirm(pending)
+                pending = None
             if stop.exists() and not cancelled:
                 stop_at = stop_at or now
                 if term_at is None and now - stop_at >= 1:
@@ -750,7 +783,10 @@ def run_terminal(cmd, env, cwd, stop):
                     data = b""
                 if data:
                     write_all(output_fd, data)
-                    pending = detector.feed(data) or pending
+                    last_output = time.monotonic()
+                    found = detector.feed(data)
+                    if found:
+                        pending, pending_at = found, last_output
                 else:
                     master_open = False
             if input_fd in ready:
@@ -773,7 +809,7 @@ def run_terminal(cmd, env, cwd, stop):
             write_all(output_fd, data)
             pending = detector.feed(data) or pending
         if pending:
-            signal_limit(account, run, pending, "terminal_banner")
+            confirm(pending)
     finally:
         termios.tcsetattr(input_fd, termios.TCSADRAIN, original)
         for sig, handler in saved.items():

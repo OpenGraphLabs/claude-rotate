@@ -16,6 +16,7 @@ import sys
 import time
 import termios
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -63,6 +64,13 @@ def main(argv):
                and not (model and model == os.environ.get("MOCK_FREE_MODEL")))
     with open(transcript, "a") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n")
+        if os.environ.get("MOCK_QUOTE_BANNER"):
+            # A reply that quotes the banner: the terminal shows it, the transcript records it.
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": {"role": "assistant", "model": "claude-opus-5-5",
+                            "content": [{"type": "text", "text": os.environ["MOCK_BANNER"]}]},
+            }, ensure_ascii=False) + "\n")
         if limited and not os.environ.get("MOCK_NO_TRANSCRIPT_ERROR"):
             f.write(json.dumps({
                 "type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",

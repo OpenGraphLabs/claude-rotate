@@ -391,6 +391,17 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual([i["account"] for i in self.invocations()], ["default"])
         self.assertNotIn("default", self.state())
 
+    def test_terminal_banner_quoted_in_conversation_does_not_rotate(self):
+        quoted = "\r\n  ⚠ Usage limit reached · limit resets 3:50pm · clau.de/wrap-up\r\n"
+        code, output = self.rotate_tty(MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1",
+                                      MOCK_NO_STOP_HOOK="1", MOCK_BANNER=quoted,
+                                      MOCK_QUOTE_BANNER="1", MOCK_WAIT="3")
+        self.assertEqual(code, 3, output)
+        self.assertEqual([i["account"] for i in self.invocations()], ["default"])
+        self.assertNotIn("default", self.state())
+        events = [json.loads(line) for line in (self.home / "events.jsonl").read_text().splitlines()]
+        self.assertIn("banner_ignored", [e["event"] for e in events])
+
     def test_terminal_external_termination_does_not_resume(self):
         sent = False
 

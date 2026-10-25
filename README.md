@@ -147,6 +147,9 @@ This handles Claude's UI-only limit notice without requiring an API error. Detec
 the warning icon, exact stopped wording, reset field and help link together. UTF-8, color codes,
 OSC hyperlinks and fragmented writes are handled. Ordinary mentions of usage limits, the
 `wrapping up` banner and the banner offering continued use with credits do not trigger a switch.
+A match is acted on once Claude has been idle for 2 s (or after 30 s), and is ignored when a
+message in the session transcript contains the banner text, i.e. when Claude, a tool or you
+printed it rather than Claude's own UI.
 The terminal is restored on exit and suspension. Piped/print runs retain the direct process path.
 Changing Claude's banner wording can require updating this detector; it is not a general screen
 reader. A parent session id from `SessionStart` is required before stopping an interactive run.
