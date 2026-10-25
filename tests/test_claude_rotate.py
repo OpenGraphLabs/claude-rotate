@@ -128,6 +128,19 @@ class Helpers(unittest.TestCase):
         self.assertEqual(out, [("-p", ["-p"]), ("--model", ["--model", "claude-opus-5-5"]),
                               ("--resume", ["--resume", "sid"]), ("--", ["--", "go on"])])
 
+    def test_switch_for_uses_fallback_where_it_is_free(self):
+        cfg = {"order": ["default", "a"], "model_fallbacks": {"fable": "claude-opus-5-5"}}
+        (self.m.ACCOUNTS / "a").mkdir(parents=True, exist_ok=True)
+        fable, opus = {"fable": {"limited_until": 10**12}}, {"opus": {"limited_until": 10**12}}
+        state = {"default": {"models": fable}}
+        self.assertEqual(self.m.switch_for(cfg, state, "default", 0, "fable"),
+                         ("default", "claude-opus-5-5"))
+        state = {"default": {"models": {**fable, **opus}}}
+        self.assertEqual(self.m.switch_for(cfg, state, "default", 0, "fable"), ("a", "claude-opus-5-5"))
+        state["a"] = {"models": opus}
+        self.assertIsNone(self.m.switch_for(cfg, state, "default", 0, "fable"))
+        self.assertEqual(self.m.switch_for(cfg, {}, "default", 0, "sonnet"), ("a", None))
+
     def test_pick_next_skips_limited(self):
         cfg = {"order": ["default", "a", "b"]}
         (self.m.ACCOUNTS / "a").mkdir(parents=True, exist_ok=True)
