@@ -97,6 +97,18 @@ class Helpers(unittest.TestCase):
         self.assertIsNone(self.m.limit_message(t))
         self.assertIsNone(self.m.limit_message(t.with_name("missing.jsonl")))
 
+    def test_transcript_lines_keep_unicode_line_separators(self):
+        # JSON leaves U+2028 unescaped and tool output contains it. str.splitlines() cut lines there
+        # and a fragment such as "1" parsed as an int: 'int' object has no attribute 'get'.
+        t = Path(self.tmp.name) / "sep.jsonl"
+        reply = {"type": "assistant", "timestamp": "2026-10-25T05:40:00Z",
+                 "message": {"model": "claude-opus-5-5",
+                             "content": [{"type": "text", "text": "a\u20280\u2028b"}]}}
+        err = {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+               "message": {"content": [{"type": "text", "text": "x\u20281\u2028" + LIMIT_TEXT}]}}
+        t.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [reply, err]) + "\n")
+        self.assertEqual(self.m.limit_message(t), "x\u20281\u2028" + LIMIT_TEXT)
+
     def test_pick_next_skips_limited(self):
         cfg = {"order": ["default", "a", "b"]}
         (self.m.ACCOUNTS / "a").mkdir(parents=True, exist_ok=True)
