@@ -17,8 +17,9 @@ resumes the parent with `--resume <session> -- <continue prompt>`.
 
 A limit that names one model ("You've reached your Fable limit") is recorded for that model only:
 the account stays usable and new sessions prefer accounts with no model limit. A session that hits
-it is resumed on the same account with the model in model_fallbacks (Fable -> Opus 5.5); a model
-without a fallback moves the session to an account where that model is free. A subagent's limit on
+it is resumed with the model in model_fallbacks (Fable -> Opus 5.5), on the same account unless the
+fallback is limited there too; a model without a fallback moves the session to an account where
+that model is free. A subagent's limit on
 a model with a fallback is only recorded, since the parent's own model is unaffected. Such messages
 carry no reset time, so the limit is assumed to last model_cooldown_hours, and it is dropped early
 once a transcript shows that model answering on the account again. Subagent transcripts are scanned
@@ -327,6 +328,12 @@ def limited_model(message):
     return m.group(1).lower() if m else None
 
 
+def model_family(model):
+    """The family a model id or alias belongs to: "opus" for claude-opus-5-5 and for opus."""
+    m = re.match(r"(?:claude-)?([a-z]+)", model or "")
+    return m.group(1) if m else None
+
+
 def limited_until(state, name):
     return (state.get(name) or {}).get("limited_until", 0)
 
@@ -388,12 +395,15 @@ def pick_next(cfg, state, current, now, model=None):
 
 def switch_for(cfg, state, account, now, model):
     """Where a session resumes after a limit: (account, model to switch to or None), or None.
-    A model limit with a fallback keeps the account; any other limit moves to the next free one."""
+    A model limit with a fallback switches to it, on this account unless the fallback is limited
+    here too; any other limit moves to the next account where the model is free."""
     fallback = model and cfg["model_fallbacks"].get(model)
     if fallback:
-        return account, fallback
+        model = model_family(fallback)
+        if model_limited_until(state, account, model) <= now:
+            return account, fallback
     nxt = pick_next(cfg, state, account, now, model)
-    return (nxt, None) if nxt else None
+    return (nxt, fallback or None) if nxt else None
 
 
 def fmt_time(ts):
@@ -533,9 +543,9 @@ def scan_models(transcript_path, since):
                 if model:
                     limits.append((model, text, at))
             else:
-                m = re.match(r"claude-([a-z]+)", message.get("model") or "")
-                if m:
-                    replied[m.group(1)] = max(replied.get(m.group(1), 0), at)
+                family = model_family(message.get("model"))
+                if family:
+                    replied[family] = max(replied.get(family, 0), at)
     return limits, replied
 
 
