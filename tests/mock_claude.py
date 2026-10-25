@@ -3,8 +3,8 @@
 
 Reads the --settings hooks the wrapper passes, runs SessionStart, writes a transcript, and when the
 account it runs on is listed in MOCK_LIMITED ends the turn with the usage-limit error (running the
-StopFailure hook, then waiting to be stopped unless --print). Every invocation is appended to
-MOCK_LOG as one JSON line.
+StopFailure hook, then waiting to be stopped unless --print); a run with `--model MOCK_FREE_MODEL`
+is never limited. Every invocation is appended to MOCK_LOG as one JSON line.
 """
 import json
 import os
@@ -31,13 +31,15 @@ def run_hooks(settings, event, payload):
 
 
 def main(argv):
-    settings, resume, printing = {}, None, False
+    settings, resume, printing, model = {}, None, False, None
     i = 0
     while i < len(argv):
         if argv[i] == "--settings":
             settings = json.loads(argv[i + 1]); i += 2; continue
         if argv[i] == "--resume":
             resume = argv[i + 1]; i += 2; continue
+        if argv[i] == "--model":
+            model = argv[i + 1]; i += 2; continue
         if argv[i] in ("-p", "--print"):
             printing = True
         if argv[i] == "--":
@@ -57,7 +59,8 @@ def main(argv):
         "hook_event_name": "SessionStart", "session_id": session_id,
         "transcript_path": str(transcript), "cwd": os.getcwd(),
     })
-    limited = account in os.environ.get("MOCK_LIMITED", "").split(",")
+    limited = (account in os.environ.get("MOCK_LIMITED", "").split(",")
+               and not (model and model == os.environ.get("MOCK_FREE_MODEL")))
     with open(transcript, "a") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n")
         if limited and not os.environ.get("MOCK_NO_TRANSCRIPT_ERROR"):
