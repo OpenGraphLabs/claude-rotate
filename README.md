@@ -135,6 +135,11 @@ After exit, the last transcript message remains a secondary source of evidence f
 whose hooks did not finish. The reset time is parsed from the message; when absent,
 `cooldown_minutes` (default 60) applies.
 
+Model-specific errors (such as a Fable limit) mark only that model as limited, with
+`model_cooldown_hours` (default 24) when no reset time is given. New sessions prefer accounts
+without a recorded model limit. A subsequent successful model response clears an older model
+limit.
+
 **Relaunch.** The original arguments are kept except anything that chooses a conversation
 (`-c`, `--resume`, `--session-id`, `--worktree`, positional prompt, ...), then
 `--resume <session> -- <continue_prompt>` is appended.
@@ -147,7 +152,7 @@ Files:
 
 ```
 ~/.claude-accounts/
-  config.json     order, cooldown_minutes, continue_prompt
+  config.json     order, cooldown_minutes, model_cooldown_hours, continue_prompt
   state.json      per-account limited_until + the limit message
   accounts/<n>/   CLAUDE_CONFIG_DIR of each extra account
   runs/           per-launch session and limit evidence while a wrapper is running

@@ -108,6 +108,8 @@ class Helpers(unittest.TestCase):
                "message": {"content": [{"type": "text", "text": "x\u20281\u2028" + LIMIT_TEXT}]}}
         t.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [reply, err]) + "\n")
         self.assertEqual(self.m.limit_message(t), "x\u20281\u2028" + LIMIT_TEXT)
+        at = datetime(2026, 10, 25, 5, 40, tzinfo=ZoneInfo("UTC")).timestamp()
+        self.assertEqual(self.m.scan_models(t, 0), ([], {"opus": at}))
 
     def test_pick_next_skips_limited(self):
         cfg = {"order": ["default", "a", "b"]}
@@ -220,6 +222,14 @@ class EndToEnd(unittest.TestCase):
         inv = self.invocations()
         self.assertEqual([i["account"] for i in inv], ["default", "dev"])
         self.assertNotIn("agent", inv[1]["argv"][inv[1]["argv"].index("--resume") + 1])
+
+    def test_rendered_hook_message_preserves_model_scope(self):
+        r = self.rotate([], MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1",
+                        MOCK_LIMIT_TEXT="You've reached your Fable limit")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        entry = self.state()["default"]
+        self.assertNotIn("limited_until", entry)
+        self.assertIn("fable", entry["models"])
 
     def test_hook_without_other_account_still_records_limit(self):
         cfg = json.loads((self.home / "config.json").read_text())
