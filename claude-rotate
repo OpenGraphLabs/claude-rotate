@@ -10,8 +10,10 @@ settings, CLAUDE.md, skills, plugins, memory and session transcripts are shared 
 
 Three hooks are passed with --settings, so ~/.claude/settings.json is not touched: SessionStart tells
 the wrapper the parent session id; StopFailure and SubagentStop persist quota errors and request a
-switch when another account is free. After Claude exits, saved evidence (or a final transcript
-error) selects the next account and resumes the parent with `--resume <session> -- <continue prompt>`.
+switch when another account is free. Interactive runs also watch Claude's stopped usage-limit
+banner through a PTY, because that UI notice need not produce an API error or transcript entry.
+After Claude exits, saved evidence (or a final transcript error) selects the next account and
+resumes the parent with `--resume <session> -- <continue prompt>`.
 
 A limit that names one model ("You've reached your Fable limit") is recorded for that model only:
 the account stays usable, a session that hits it moves only to an account where that model is free,
@@ -35,15 +37,21 @@ session started with it is not moved while it runs; a --print run still is, afte
 """
 
 import fcntl
+import codecs
+import errno
 import json
 import os
+import pty
 import re
+import select
 import shlex
 import signal
 import subprocess
 import sys
 import threading
 import time
+import termios
+import tty
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -375,7 +383,7 @@ def fmt_time(ts):
 
 
 def log_event(run, account, event, **fields):
-    """Small diagnostic records; never log prompts or credentials."""
+    """Small diagnostic records; never log prompts, terminal output, or credentials."""
     HOME.mkdir(parents=True, exist_ok=True)
     record = {"at": datetime.now().astimezone().isoformat(), "run": run,
               "account": account, "event": event, **fields}
@@ -576,6 +584,171 @@ def resume_parts(parts, session_id, prompt):
     return kept + [("--resume", ["--resume", session_id]), ("--", ["--", prompt])]
 
 
+class TerminalLimitDetector:
+    """Recognize the stopped quota banner, not arbitrary mentions of a usage limit.
+
+    Ink can split UTF-8 and ANSI sequences across writes. Strip styling and OSC hyperlinks,
+    retain line boundaries, and require the warning icon, reset field and Claude help link.
+    Running/grace and paid-credits banners intentionally do not match.
+    """
+    banner = re.compile(
+        r"(?:^|[\r\n])[\t ]*⚠\ufe0f?[\t ]+Usage limit reached[\t ]+·[\t ]+"
+        r"limit resets (?P<reset>[^\r\n·]{1,80}?) *· *clau\.de/wrap-up(?=\s|$)"
+    )
+
+    def __init__(self):
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.text = ""
+        self.state = "text"
+        self.detected = False
+
+    def feed(self, data):
+        if self.detected:
+            return None
+        for c in self.decoder.decode(data):
+            if self.state == "text":
+                if c == "\x1b":
+                    self.state = "escape"
+                elif c in "\r\n\t" or c >= " ":
+                    self.text += c
+            elif self.state == "escape":
+                self.state = {"[": "csi", "]": "osc"}.get(c, "text")
+            elif self.state == "csi":
+                if "@" <= c <= "~":
+                    # Cursor movement/erase separates draws; SGR only changes styling.
+                    if c != "m":
+                        self.text += "\n"
+                    self.state = "text"
+            elif self.state == "osc":
+                if c == "\x07":
+                    self.state = "text"
+                elif c == "\x1b":
+                    self.state = "osc_end"
+            elif self.state == "osc_end":
+                self.state = "text" if c == "\\" else "osc"
+        self.text = self.text[-8192:]
+        match = self.banner.search(self.text)
+        if match:
+            self.detected = True
+            return f"Usage limit reached · resets {match['reset'].strip()}"
+        return None
+
+
+def run_terminal(cmd, env, cwd, stop):
+    """Proxy the interactive terminal so quota notices without hooks are observable."""
+    input_fd, output_fd = sys.stdin.fileno(), sys.stdout.fileno()
+    original = termios.tcgetattr(input_fd)
+    size = fcntl.ioctl(input_fd, termios.TIOCGWINSZ, b"\0" * 8)
+    pid, master = pty.fork()
+    if pid == 0:
+        try:
+            if cwd:
+                os.chdir(cwd)
+            fcntl.ioctl(0, termios.TIOCSWINSZ, size)
+            os.execvpe(cmd[0], cmd, env)
+        finally:
+            os._exit(127)
+    detector = TerminalLimitDetector()
+    account, run = env["CLAUDE_ROTATE_ACCOUNT"], env["CLAUDE_ROTATE_RUN"]
+    cancelled = False
+    pending = None
+    stop_at = None
+    term_at = None
+    status = None
+    master_open = True
+
+    def send(sig):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def forward(sig, _frame):
+        nonlocal cancelled
+        cancelled = True
+        send(sig)
+
+    def resize(*_):
+        fcntl.ioctl(master, termios.TIOCSWINSZ,
+                    fcntl.ioctl(input_fd, termios.TIOCGWINSZ, b"\0" * 8))
+
+    def write_all(fd, data):
+        while data:
+            data = data[os.write(fd, data):]
+
+    saved = {s: signal.signal(s, forward)
+             for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT)}
+    saved[signal.SIGWINCH] = signal.signal(signal.SIGWINCH, resize)
+    try:
+        tty.setraw(input_fd)
+        while True:
+            waited, child_status = os.waitpid(pid, os.WNOHANG | os.WUNTRACED)
+            if waited:
+                if os.WIFSTOPPED(child_status):
+                    termios.tcsetattr(input_fd, termios.TCSADRAIN, original)
+                    os.kill(os.getpid(), signal.SIGSTOP)
+                    tty.setraw(input_fd)
+                    resize()
+                    send(signal.SIGCONT)
+                else:
+                    status = child_status
+                    break
+            if pending and read_json(RUNS / f"{run}.session.json", {}).get("session_id"):
+                signal_limit(account, run, pending, "terminal_banner")
+                pending = None
+            now = time.monotonic()
+            if stop.exists() and not cancelled:
+                stop_at = stop_at or now
+                if term_at is None and now - stop_at >= 1:
+                    send(signal.SIGTERM)
+                    term_at = now
+                elif term_at is not None and now - term_at >= 10:
+                    send(signal.SIGKILL)
+            ready, _, _ = select.select([input_fd] + ([master] if master_open else []), [], [], 0.1)
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    data = b""
+                if data:
+                    write_all(output_fd, data)
+                    pending = detector.feed(data) or pending
+                else:
+                    master_open = False
+            if input_fd in ready:
+                data = os.read(input_fd, 65536)
+                if data:
+                    write_all(master, data)
+                else:
+                    cancelled = True
+                    send(signal.SIGHUP)
+        # Flush any output produced just before exit.
+        while master_open and select.select([master], [], [], 0)[0]:
+            try:
+                data = os.read(master, 65536)
+            except OSError as exc:
+                if exc.errno != errno.EIO:
+                    raise
+                break
+            if not data:
+                break
+            write_all(output_fd, data)
+            pending = detector.feed(data) or pending
+        if pending:
+            signal_limit(account, run, pending, "terminal_banner")
+    finally:
+        termios.tcsetattr(input_fd, termios.TCSADRAIN, original)
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+        os.close(master)
+        if status is None:
+            send(signal.SIGKILL)
+            os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status), cancelled
+
+
 def run_once(cmd, env, cwd, stop):
     """Run claude in the foreground; end it once the StopFailure hook creates the stop file."""
     proc = subprocess.Popen(cmd, env=env, cwd=cwd)
@@ -640,7 +813,8 @@ def cmd_run(args):
             env.update(CLAUDE_ROTATE_ACCOUNT=account, CLAUDE_ROTATE_RUN=run)
             info(f"account {account} ({account_email(account) or 'not signed in'})")
             started = time.time()
-            code, cancelled = run_once([claude, *command_line(parts, settings)], env, cwd, stop)
+            runner = run_terminal if not printing and sys.stdin.isatty() and sys.stdout.isatty() else run_once
+            code, cancelled = runner([claude, *command_line(parts, settings)], env, cwd, stop)
             stopped = stop.exists()
             stop.unlink(missing_ok=True)
             session = read_json(session_file, None)

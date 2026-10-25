@@ -11,7 +11,8 @@ the conversation over. `claude-rotate` is a single-file Python wrapper that:
 - keeps each extra account in its own `CLAUDE_CONFIG_DIR` while sharing settings, `CLAUDE.md`,
   skills, plugins, memory and session transcripts with your main login;
 - starts `claude` on the first account that is not limited;
-- notices usage limits through main/subagent error hooks and the session transcript,
+- notices usage limits through main/subagent error hooks, transcript errors, or the stopped
+  terminal banner (including the banner that has no corresponding API error),
   records when that account resets, and relaunches `claude --resume <session>` on the next free
   account with a short "continue where you left off" prompt;
 - does the same for `claude -p` (print mode) runs after they exit.
@@ -135,10 +136,25 @@ After exit, the last transcript message remains a secondary source of evidence f
 whose hooks did not finish. The reset time is parsed from the message; when absent,
 `cooldown_minutes` (default 60) applies.
 
+Interactive sessions with a TTY on both stdin and stdout run through a PTY. The wrapper forwards
+input, output and terminal resizing and watches for this stopped banner:
+
+```text
+⚠ Usage limit reached · limit resets 3:50pm · clau.de/wrap-up
+```
+
+This handles Claude's UI-only limit notice without requiring an API error. Detection requires
+the warning icon, exact stopped wording, reset field and help link together. UTF-8, color codes,
+OSC hyperlinks and fragmented writes are handled. Ordinary mentions of usage limits, the
+`wrapping up` banner and the banner offering continued use with credits do not trigger a switch.
+The terminal is restored on exit and suspension. Piped/print runs retain the direct process path.
+Changing Claude's banner wording can require updating this detector; it is not a general screen
+reader. A parent session id from `SessionStart` is required before stopping an interactive run.
+
 Model-specific errors (such as a Fable limit) mark only that model as limited, with
 `model_cooldown_hours` (default 24) when no reset time is given. New sessions prefer accounts
 without a recorded model limit. A subsequent successful model response clears an older model
-limit.
+limit. Terminal banners without a model name are treated as account-wide limits.
 
 **Relaunch.** The original arguments are kept except anything that chooses a conversation
 (`-c`, `--resume`, `--session-id`, `--worktree`, positional prompt, ...), then
@@ -171,6 +187,8 @@ Environment variables: `CLAUDE_ROTATE_HOME` (default `~/.claude-accounts`),
   recorded limit in `state.json` is shared so later launches start on a free account.
 - Ctrl-C, Ctrl-\ and Ctrl-Z go to `claude`; the wrapper survives them.
 - An external SIGTERM/SIGHUP is forwarded and never causes an automatic relaunch.
+- Detection diagnostics do not contain prompts or captured terminal output. The PTY detector
+  keeps only a bounded in-memory text tail; it does not save a terminal recording.
 - Not tested on Windows (uses `fcntl` and POSIX signals).
 
 ## Development
