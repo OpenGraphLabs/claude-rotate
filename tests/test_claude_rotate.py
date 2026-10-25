@@ -6,9 +6,17 @@ real ~/.claude and ~/.claude-accounts are never read or written.
 import importlib.util
 import json
 import os
+import errno
+import fcntl
+import pty
+import select
+import signal
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,6 +26,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "claude-rotate"
 MOCK = ROOT / "tests" / "mock_claude.py"
 LIMIT_TEXT = "You've hit your weekly limit · resets Oct 6 at 2am (Asia/Seoul)"
+BANNER = "\r\n ⚠ \x1b[33mUsage limit reached\x1b[0m · limit resets 3:50pm · " \
+         "\x1b]8;;https://clau.de/wrap-up\x1b\\clau.de/wrap-up\x1b]8;;\x1b\\\r\n"
 
 
 def load_module():
@@ -120,6 +130,33 @@ class Helpers(unittest.TestCase):
         self.assertEqual(self.m.pick_next(cfg, state, "b", 0), "default")
         self.assertIsNone(self.m.pick_next(cfg, {"default": {"limited_until": 10**12}, **state}, "b", 0))
 
+    def test_banner_across_utf8_and_ansi_boundaries(self):
+        detector = self.m.TerminalLimitDetector()
+        found = [message for byte in BANNER.encode()
+                 if (message := detector.feed(bytes([byte])))]
+        self.assertEqual(found, ["Usage limit reached · resets 3:50pm"])
+        self.assertIsNone(detector.feed(BANNER.encode()))
+
+    def test_banner_ignores_conversation_running_and_paid_usage(self):
+        for text in [
+            "Usage limit reached",
+            "The error was: Usage limit reached · limit resets 3:50pm · clau.de/wrap-up",
+            "⚠ Usage limit reached · wrapping up · limit resets 3:50pm · clau.de/wrap-up",
+            "⚠ Usage limit reached · brief included wrap-up, then usage credits · clau.de/wrap-up",
+            "⚠ Usage limit approaching · limit resets 3:50pm · clau.de/wrap-up",
+            "> ⚠ Usage limit reached · limit resets 3:50pm · clau.de/wrap-up",
+        ]:
+            with self.subTest(text=text):
+                self.assertIsNone(self.m.TerminalLimitDetector().feed(text.encode()))
+
+    def test_banner_cursor_redraw_and_long_output(self):
+        detector = self.m.TerminalLimitDetector()
+        detector.feed(b"ordinary output" * 1000)
+        self.assertLessEqual(len(detector.text), 8192)
+        text = "\x1b[2K\x1b[1G⚠ Usage limit reached · limit resets 3:50pm · clau.de/wrap-up"
+        self.assertIn("resets 3:50pm", detector.feed(text.encode()))
+
+
 class EndToEnd(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -159,6 +196,45 @@ class EndToEnd(unittest.TestCase):
         env = {**self.env, **extra}
         return subprocess.run([sys.executable, str(SCRIPT), *args], env=env, cwd=self.cwd,
                               capture_output=True, text=True, timeout=60)
+
+    def rotate_tty(self, *, callback=None, **extra):
+        master, slave = pty.openpty()
+        size = struct.pack("HHHH", 42, 120, 0, 0)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, size)
+        original = termios.tcgetattr(slave)
+        proc = subprocess.Popen([sys.executable, str(SCRIPT)], env={**self.env, **extra},
+                                cwd=self.cwd, stdin=slave, stdout=slave, stderr=slave)
+        output = b""
+        deadline = time.monotonic() + 15
+        try:
+            while proc.poll() is None:
+                self.assertLess(time.monotonic(), deadline, output.decode(errors="replace"))
+                if callback:
+                    callback(proc, output, master, slave)
+                if select.select([master], [], [], 0.05)[0]:
+                    output += os.read(master, 65536)
+            while select.select([master], [], [], 0)[0]:
+                try:
+                    data = os.read(master, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    break
+                if not data:
+                    break
+                output += data
+            restored = termios.tcgetattr(slave)
+            # Darwin can set the kernel-owned "retype pending input" bit on tcsetattr.
+            restored[3] &= ~getattr(termios, "PENDIN", 0)
+            original[3] &= ~getattr(termios, "PENDIN", 0)
+            self.assertEqual(restored, original, "terminal settings not restored")
+            return proc.returncode, output.decode(errors="replace")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(master)
+            os.close(slave)
 
     def invocations(self):
         return [json.loads(l) for l in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -239,6 +315,87 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertIn("limited_until", self.state()["default"])
         self.assertIn("no other account is free", r.stderr)
+
+    def test_terminal_only_banner_rotates_with_same_parent_session(self):
+        code, output = self.rotate_tty(MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1",
+                                      MOCK_NO_STOP_HOOK="1", MOCK_BANNER=BANNER,
+                                      MOCK_FRAGMENT_BANNER="1")
+        self.assertEqual(code, 0, output)
+        inv = self.invocations()
+        self.assertEqual([i["account"] for i in inv], ["default", "dev"])
+        self.assertTrue(all(i["tty"] for i in inv))
+        self.assertEqual(inv[0]["size"], list(struct.pack("HHHH", 42, 120, 0, 0)))
+        self.assertIn("mock finished", output)
+        events = [json.loads(line) for line in (self.home / "events.jsonl").read_text().splitlines()]
+        detected = next(e for e in events if e["event"] == "limit_detected")
+        self.assertEqual(detected["source"], "terminal_banner")
+        second = inv[1]["argv"]
+        self.assertEqual(second[second.index("--resume") + 1], detected["session_id"])
+        self.assertFalse(list((self.home / "runs").iterdir()))
+
+    def test_terminal_normal_text_does_not_rotate(self):
+        code, output = self.rotate_tty(MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1",
+                                      MOCK_NO_STOP_HOOK="1",
+                                      MOCK_BANNER="Usage limit reached\n", MOCK_WAIT="0.2")
+        self.assertEqual(code, 3, output)
+        self.assertEqual([i["account"] for i in self.invocations()], ["default"])
+        self.assertNotIn("default", self.state())
+
+    def test_terminal_external_termination_does_not_resume(self):
+        sent = False
+
+        def terminate(proc, output, master, slave):
+            nonlocal sent
+            if not sent and b"clau.de/wrap-up" in output:
+                sent = True
+                proc.send_signal(signal.SIGTERM)
+
+        code, output = self.rotate_tty(callback=terminate, MOCK_LIMITED="default",
+                                      MOCK_NO_TRANSCRIPT_ERROR="1", MOCK_NO_STOP_HOOK="1",
+                                      MOCK_BANNER=BANNER)
+        self.assertTrue(sent, output)
+        self.assertEqual([i["account"] for i in self.invocations()], ["default"])
+
+    def test_terminal_resize_and_keyboard_interrupt(self):
+        resized = interrupted = False
+
+        def control(proc, output, master, slave):
+            nonlocal resized, interrupted
+            if not resized and b"mock ready" in output:
+                resized = True
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 33, 99, 0, 0))
+                proc.send_signal(signal.SIGWINCH)
+            if not interrupted and b"RESIZED 33x99" in output:
+                interrupted = True
+                os.write(master, b"\x03")
+
+        code, output = self.rotate_tty(callback=control, MOCK_LIMITED="default",
+                                      MOCK_NO_TRANSCRIPT_ERROR="1", MOCK_NO_STOP_HOOK="1",
+                                      MOCK_REPORT_RESIZE="1")
+        self.assertTrue(interrupted, output)
+        self.assertEqual(code, 130, output)
+        self.assertEqual([i["account"] for i in self.invocations()], ["default"])
+
+    def test_terminal_suspend_and_continue(self):
+        resumed = False
+
+        def control(proc, output, master, slave):
+            nonlocal resumed
+            if not resumed:
+                pid, status = os.waitpid(proc.pid, os.WNOHANG | os.WUNTRACED)
+                if pid:
+                    self.assertTrue(os.WIFSTOPPED(status))
+                    # The outer terminal is usable while the wrapper is suspended.
+                    self.assertTrue(termios.tcgetattr(slave)[3] & termios.ICANON)
+                    resumed = True
+                    proc.send_signal(signal.SIGCONT)
+
+        code, output = self.rotate_tty(callback=control, MOCK_LIMITED="default",
+                                      MOCK_NO_TRANSCRIPT_ERROR="1", MOCK_NO_STOP_HOOK="1",
+                                      MOCK_SUSPEND="1", MOCK_WAIT="0.2")
+        self.assertTrue(resumed, output)
+        self.assertEqual(code, 3, output)
+        self.assertIn("mock resumed", output)
 
     def test_interactive_quit_without_hook_stays_quit(self):
         r = self.rotate([], MOCK_LIMITED="default", MOCK_NO_STOP_HOOK="1", MOCK_WAIT="2")

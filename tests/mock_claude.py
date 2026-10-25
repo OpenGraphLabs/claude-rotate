@@ -8,10 +8,13 @@ MOCK_LOG as one JSON line.
 """
 import json
 import os
+import fcntl
 import signal
+import struct
 import subprocess
 import sys
 import time
+import termios
 import uuid
 from pathlib import Path
 
@@ -43,7 +46,10 @@ def main(argv):
     account = os.environ.get("CLAUDE_ROTATE_ACCOUNT", "no-wrapper")
     with open(os.environ["MOCK_LOG"], "a") as f:
         f.write(json.dumps({"argv": argv, "account": account, "cwd": os.getcwd(),
-                            "run": os.environ.get("CLAUDE_ROTATE_RUN")}) + "\n")
+                            "run": os.environ.get("CLAUDE_ROTATE_RUN"),
+                            "tty": sys.stdin.isatty(),
+                            "size": list(fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
+                            if sys.stdin.isatty() else None}) + "\n")
 
     session_id = resume or str(uuid.uuid4())
     transcript = Path(os.environ["MOCK_TRANSCRIPTS"]) / f"{session_id}.jsonl"
@@ -64,6 +70,14 @@ def main(argv):
             f.write(json.dumps({"type": "assistant", "message": {
                 "role": "assistant", "content": [{"type": "text", "text": "done"}]}}) + "\n")
     if limited:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+        if os.environ.get("MOCK_REPORT_RESIZE"):
+            def resized(*_):
+                rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
+                print(f"RESIZED {rows}x{cols}", flush=True)
+            signal.signal(signal.SIGWINCH, resized)
+            print("mock ready", flush=True)
         if os.environ.get("MOCK_SUBAGENT_LIMIT"):
             agent = transcript.with_name("agent.jsonl")
             agent.write_text(json.dumps({
@@ -81,13 +95,24 @@ def main(argv):
                 "transcript_path": str(transcript), "last_assistant_message": os.environ["MOCK_LIMIT_TEXT"],
                 "error_details": "429 Too Many Requests",
             })
+        if os.environ.get("MOCK_BANNER"):
+            data = os.environ["MOCK_BANNER"].encode()
+            if os.environ.get("MOCK_FRAGMENT_BANNER"):
+                for byte in data:
+                    os.write(1, bytes([byte]))
+                    time.sleep(0.001)
+            else:
+                os.write(1, data)
+        if os.environ.get("MOCK_SUSPEND"):
+            os.kill(os.getpid(), signal.SIGSTOP)
+            print("mock resumed", flush=True)
         if not printing:
             # An interactive session keeps running until the wrapper stops it.
-            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
             deadline = time.time() + float(os.environ.get("MOCK_WAIT", "20"))
             while time.time() < deadline:
                 time.sleep(0.1)
             return 3
+    print("mock finished", flush=True)
     return 0
 
 
