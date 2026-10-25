@@ -118,7 +118,6 @@ class Helpers(unittest.TestCase):
         self.assertEqual(self.m.pick_next(cfg, state, "b", 0), "default")
         self.assertIsNone(self.m.pick_next(cfg, {"default": {"limited_until": 10**12}, **state}, "b", 0))
 
-
 class EndToEnd(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -203,6 +202,33 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([i["account"] for i in self.invocations()], ["default", "dev"])
         self.assertIn("resuming session", r.stderr)
+
+    def test_hook_evidence_survives_missing_transcript_error(self):
+        r = self.rotate([], MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        inv = self.invocations()
+        self.assertEqual([i["account"] for i in inv], ["default", "dev"])
+        self.assertNotEqual(inv[0]["run"], inv[1]["run"])
+        events = [json.loads(line) for line in (self.home / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([e["source"] for e in events if e["event"] == "limit_detected"],
+                         ["StopFailure"])
+
+    def test_subagent_limit_resumes_parent_without_main_error(self):
+        r = self.rotate([], MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1",
+                        MOCK_SUBAGENT_LIMIT="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        inv = self.invocations()
+        self.assertEqual([i["account"] for i in inv], ["default", "dev"])
+        self.assertNotIn("agent", inv[1]["argv"][inv[1]["argv"].index("--resume") + 1])
+
+    def test_hook_without_other_account_still_records_limit(self):
+        cfg = json.loads((self.home / "config.json").read_text())
+        cfg["order"] = ["default"]
+        (self.home / "config.json").write_text(json.dumps(cfg))
+        r = self.rotate([], MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1", MOCK_WAIT="0.2")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("limited_until", self.state()["default"])
+        self.assertIn("no other account is free", r.stderr)
 
     def test_interactive_quit_without_hook_stays_quit(self):
         r = self.rotate([], MOCK_LIMITED="default", MOCK_NO_STOP_HOOK="1", MOCK_WAIT="2")

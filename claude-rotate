@@ -8,12 +8,10 @@ settings, CLAUDE.md, skills, plugins, memory and session transcripts are shared 
 `claude --resume <id>` works on any account. The account "default" is the normal login
 (no CLAUDE_CONFIG_DIR).
 
-Two hooks are passed with --settings, so ~/.claude/settings.json is not touched: SessionStart tells
-the wrapper the session id, and StopFailure (error "rate_limit") asks it to stop claude when
-another account is free. After claude exits, the wrapper reads the transcript: when the last
-message is the usage-limit error it records the account as limited until the reset time in that
-message and starts claude again on the next free account with
-`--resume <session> -- <continue prompt>`. A --print run is moved the same way after it exits.
+Three hooks are passed with --settings, so ~/.claude/settings.json is not touched: SessionStart tells
+the wrapper the parent session id; StopFailure and SubagentStop persist quota errors and request a
+switch when another account is free. After Claude exits, saved evidence (or a final transcript
+error) selects the next account and resumes the parent with `--resume <session> -- <continue prompt>`.
 
 usage:
   claude-rotate [claude args...]              run claude on the first account that is not limited
@@ -301,6 +299,13 @@ def limited_until(state, name):
     return (state.get(name) or {}).get("limited_until", 0)
 
 
+def record_limit(state, account, message, now, cfg):
+    """Record a usage-limit message for the account. Returns the time it is free again."""
+    until = parse_reset(message, now) or now + cfg["cooldown_minutes"] * 60
+    state[account] = {"limited_until": until, "message": message[:300], "recorded_at": now}
+    return until
+
+
 def usable(cfg):
     return [a for a in cfg["order"] if a == DEFAULT or (ACCOUNTS / a).is_dir()] or [DEFAULT]
 
@@ -329,22 +334,64 @@ def fmt_time(ts):
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
 
 
+def log_event(run, account, event, **fields):
+    """Small diagnostic records; never log prompts or credentials."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    record = {"at": datetime.now().astimezone().isoformat(), "run": run,
+              "account": account, "event": event, **fields}
+    with open(HOME / "events.jsonl", "a") as f:
+        os.chmod(f.name, 0o600)
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def signal_limit(account, run, message, source):
+    """Persist evidence before asking the parent to stop. First signal per launch wins."""
+    RUNS.mkdir(parents=True, exist_ok=True)
+    with open(RUNS / f"{run}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        evidence_file = RUNS / f"{run}.limit.json"
+        if evidence_file.exists():
+            return
+        now, cfg = time.time(), load_config()
+
+        def record(state):
+            until = record_limit(state, account, message, now, cfg)
+            return until, pick_next(cfg, state, account, now)
+
+        until, nxt = with_state(record)
+        evidence = {"account": account, "message": message[:1000], "source": source,
+                    "recorded_at": now, "limited_until": until}
+        write_json(evidence_file, evidence)
+        session = read_json(RUNS / f"{run}.session.json", {})
+        log_event(run, account, "limit_detected", source=source,
+                  limited_until=until, session_id=session.get("session_id"), next_account=nxt)
+        if nxt and session.get("session_id"):
+            (RUNS / f"{run}.stop").touch()
+        elif not session.get("session_id"):
+            log_event(run, account, "rotation_skipped", reason="missing_session")
+
+
 def cmd_hook():
-    """SessionStart: tell the wrapper which session runs. StopFailure (rate_limit): ask the wrapper
-    to stop claude when another account is free. Claude Code may kill hooks still running when a
-    --print session exits, so the wrapper reads the limit itself from the transcript afterwards."""
+    """Persist parent identity and main/subagent limit evidence before requesting rotation.
+    Print-mode Claude may exit before its hook finishes, so transcript detection is also kept."""
     payload = json.load(sys.stdin)
     account, run = os.environ.get("CLAUDE_ROTATE_ACCOUNT"), os.environ.get("CLAUDE_ROTATE_RUN")
     if not account or not run:
         return 0
-    if payload.get("hook_event_name") == "SessionStart":
+    event = payload.get("hook_event_name")
+    if event == "SessionStart":
         write_json(RUNS / f"{run}.session.json",
                    {k: payload.get(k) for k in ("session_id", "transcript_path", "cwd")})
-    elif payload.get("error") == "rate_limit":
-        state = read_json(STATE, {})
-        state[account] = {"limited_until": float("inf")}
-        if pick_next(load_config(), state, account, time.time()):
-            (RUNS / f"{run}.stop").touch()
+        log_event(run, account, "session_started", session_id=payload.get("session_id"))
+    elif event == "SubagentStop":
+        message = limit_message(payload.get("agent_transcript_path"), sidechain=True)
+        if message:
+            signal_limit(account, run, message, "SubagentStop")
+    elif event == "StopFailure" and payload.get("error") == "rate_limit":
+        # error_details is often just "429". The rendered message contains the reset time.
+        message = str(payload.get("last_assistant_message") or payload.get("error_details")
+                      or "Rate limit reached")
+        signal_limit(account, run, message, "StopFailure")
     return 0
 
 
@@ -354,8 +401,9 @@ def read_lines(path):
     return Path(path).read_text().split("\n")
 
 
-def limit_message(transcript_path):
-    """Text of the usage-limit error when it is the last message of the transcript, else None."""
+def limit_message(transcript_path, sidechain=False):
+    """Text of the usage-limit error when it is the last message of the transcript, else None.
+    Subagent entries are skipped unless `sidechain` (the transcript is a subagent's own)."""
     try:
         lines = read_lines(transcript_path)[-200:]
     except (FileNotFoundError, TypeError):
@@ -365,8 +413,8 @@ def limit_message(transcript_path):
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if (not isinstance(entry, dict) or entry.get("type") not in ("user", "assistant")
-                or entry.get("isSidechain")):
+        if not isinstance(entry, dict) or entry.get("type") not in ("user", "assistant") or (
+                entry.get("isSidechain") and not sidechain):
             continue
         if entry.get("isApiErrorMessage") and entry.get("error") == "rate_limit":
             content = (entry.get("message") or {}).get("content") or []
@@ -417,6 +465,7 @@ def hook_settings(parts):
     hooks = settings.setdefault("hooks", {})
     hooks.setdefault("SessionStart", []).append({"hooks": [hook]})
     hooks.setdefault("StopFailure", []).append({"matcher": "rate_limit", "hooks": [hook]})
+    hooks.setdefault("SubagentStop", []).append({"hooks": [hook]})
     return json.dumps(settings)
 
 
@@ -435,6 +484,7 @@ def run_once(cmd, env, cwd, stop):
     """Run claude in the foreground; end it once the StopFailure hook creates the stop file."""
     proc = subprocess.Popen(cmd, env=env, cwd=cwd)
     exited = threading.Event()
+    cancelled = False
 
     def watch():
         while not exited.wait(0.3):
@@ -450,6 +500,8 @@ def run_once(cmd, env, cwd, stop):
                 return
 
     def forward(sig, _frame):
+        nonlocal cancelled
+        cancelled = True
         try:
             os.kill(proc.pid, sig)
         except ProcessLookupError:
@@ -472,51 +524,57 @@ def run_once(cmd, env, cwd, stop):
         for s, handler in saved.items():
             signal.signal(s, handler)
     proc.returncode = os.waitstatus_to_exitcode(status)
-    return proc.returncode
+    return proc.returncode, cancelled
 
 
 def cmd_run(args):
     cfg, claude = load_config(), find_claude()
-    run = uuid.uuid4().hex
-    stop, session_file = RUNS / f"{run}.stop", RUNS / f"{run}.session.json"
     parts = split_args(args)
     settings = hook_settings(parts)
     printing = any(name in ("-p", "--print") for name, _ in parts)
     account = with_state(lambda state: pick_first(cfg, state, time.time()))
     prev = cwd = None
-    try:
-        while True:
+    while True:
+        # Separate launches so late hooks from the old account cannot stop the new one.
+        run = uuid.uuid4().hex
+        stop, session_file = RUNS / f"{run}.stop", RUNS / f"{run}.session.json"
+        try:
             prepare_account(account, prev)
             env = account_env(account)
             env.update(CLAUDE_ROTATE_ACCOUNT=account, CLAUDE_ROTATE_RUN=run)
             info(f"account {account} ({account_email(account) or 'not signed in'})")
-            code = run_once([claude, *command_line(parts, settings)], env, cwd, stop)
+            code, cancelled = run_once([claude, *command_line(parts, settings)], env, cwd, stop)
             stopped = stop.exists()
             stop.unlink(missing_ok=True)
             session = read_json(session_file, None)
-            message = session and limit_message(session.get("transcript_path"))
+            evidence = read_json(RUNS / f"{run}.limit.json", None)
+            message = evidence["message"] if evidence else session and limit_message(session.get("transcript_path"))
             if message is None:
                 return code
             now = time.time()
-            until = parse_reset(message, now) or now + cfg["cooldown_minutes"] * 60
 
             def record(state):
-                state[account] = {"limited_until": until, "message": message[:300], "recorded_at": now}
-                return pick_next(cfg, state, account, now)
+                until = evidence["limited_until"] if evidence else record_limit(
+                    state, account, message, now, cfg)
+                return until, pick_next(cfg, state, account, now)
 
-            nxt = with_state(record)
+            until, nxt = with_state(record)
             info(f"{account} hit its usage limit (free again around {fmt_time(until)})")
-            # An interactive session only moves when the hook stopped it; if the user quit, stay quit.
-            if not nxt or not (stopped or printing):
+            # Explicit termination must not restart the user's session.
+            if cancelled or not session or not nxt or not (stopped or printing):
                 if not nxt:
                     info("no other account is free")
+                log_event(run, account, "rotation_skipped",
+                          reason="cancelled" if cancelled else "missing_session" if not session
+                          else "no_free_account" if not nxt else "user_exit")
                 return code
             prev, account, cwd = account, nxt, session.get("cwd") or cwd
             info(f"resuming session {session['session_id']} on {account}")
+            log_event(run, prev, "resuming", session_id=session["session_id"], next_account=account)
             parts = resume_parts(parts, session["session_id"], cfg["continue_prompt"])
-    finally:
-        stop.unlink(missing_ok=True)
-        session_file.unlink(missing_ok=True)
+        finally:
+            for suffix in (".stop", ".session.json", ".limit.json", ".lock"):
+                (RUNS / f"{run}{suffix}").unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------- account commands

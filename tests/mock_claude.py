@@ -42,7 +42,8 @@ def main(argv):
         i += 1
     account = os.environ.get("CLAUDE_ROTATE_ACCOUNT", "no-wrapper")
     with open(os.environ["MOCK_LOG"], "a") as f:
-        f.write(json.dumps({"argv": argv, "account": account, "cwd": os.getcwd()}) + "\n")
+        f.write(json.dumps({"argv": argv, "account": account, "cwd": os.getcwd(),
+                            "run": os.environ.get("CLAUDE_ROTATE_RUN")}) + "\n")
 
     session_id = resume or str(uuid.uuid4())
     transcript = Path(os.environ["MOCK_TRANSCRIPTS"]) / f"{session_id}.jsonl"
@@ -53,7 +54,7 @@ def main(argv):
     limited = account in os.environ.get("MOCK_LIMITED", "").split(",")
     with open(transcript, "a") as f:
         f.write(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n")
-        if limited:
+        if limited and not os.environ.get("MOCK_NO_TRANSCRIPT_ERROR"):
             f.write(json.dumps({
                 "type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
                 "message": {"role": "assistant",
@@ -63,10 +64,22 @@ def main(argv):
             f.write(json.dumps({"type": "assistant", "message": {
                 "role": "assistant", "content": [{"type": "text", "text": "done"}]}}) + "\n")
     if limited:
-        if not os.environ.get("MOCK_NO_STOP_HOOK"):
+        if os.environ.get("MOCK_SUBAGENT_LIMIT"):
+            agent = transcript.with_name("agent.jsonl")
+            agent.write_text(json.dumps({
+                "type": "assistant", "isSidechain": True, "isApiErrorMessage": True,
+                "error": "rate_limit", "message": {"content": [
+                    {"type": "text", "text": os.environ["MOCK_LIMIT_TEXT"]}]},
+            }) + "\n")
+            run_hooks(settings, "SubagentStop", {
+                "hook_event_name": "SubagentStop", "session_id": session_id,
+                "agent_id": "agent", "agent_transcript_path": str(agent),
+            })
+        elif not os.environ.get("MOCK_NO_STOP_HOOK"):
             run_hooks(settings, "StopFailure", {
                 "hook_event_name": "StopFailure", "error": "rate_limit", "session_id": session_id,
                 "transcript_path": str(transcript), "last_assistant_message": os.environ["MOCK_LIMIT_TEXT"],
+                "error_details": "429 Too Many Requests",
             })
         if not printing:
             # An interactive session keeps running until the wrapper stops it.
