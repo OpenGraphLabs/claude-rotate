@@ -19,6 +19,7 @@ import termios
 import time
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -174,6 +175,21 @@ class Helpers(unittest.TestCase):
         self.assertEqual(self.m.pick_next(cfg, state, "default", 0, "fable"), "b")
         self.assertEqual(self.m.pick_next(cfg, state, "default", 0), "a")
         self.assertEqual(self.m.pick_first(cfg, state, 0), "b")
+
+    def test_hook_from_wrapper_without_model_switch_keeps_session(self):
+        # A wrapper started before model fallbacks cannot switch models; a stop request for a
+        # Fable limit would end its session, so the hook only records the limit.
+        for flag, stops in ((None, False), ("1", True)):
+            with self.subTest(flag=flag):
+                run = f"compat{flag}"
+                self.m.write_json(self.m.RUNS / f"{run}.session.json", {"session_id": "s"})
+                env = {k: v for k, v in os.environ.items() if k != "CLAUDE_ROTATE_MODEL_SWITCH"}
+                if flag:
+                    env["CLAUDE_ROTATE_MODEL_SWITCH"] = flag
+                with mock.patch.dict(os.environ, env, clear=True):
+                    self.m.signal_limit("default", run, FABLE_TEXT, "StopFailure")
+                self.assertEqual((self.m.RUNS / f"{run}.stop").exists(), stops)
+                self.assertTrue((self.m.RUNS / f"{run}.limit.json").exists())
 
     def test_pick_next_skips_limited(self):
         cfg = {"order": ["default", "a", "b"]}
