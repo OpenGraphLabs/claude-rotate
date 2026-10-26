@@ -393,11 +393,12 @@ def pick_next(cfg, state, current, now, model=None):
     return None
 
 
-def switch_for(cfg, state, account, now, model):
+def switch_for(cfg, state, account, now, model, model_switch=True):
     """Where a session resumes after a limit: (account, model to switch to or None), or None.
     A model limit with a fallback switches to it, on this account unless the fallback is limited
-    here too; any other limit moves to the next account where the model is free."""
-    fallback = model and cfg["model_fallbacks"].get(model)
+    here too; any other limit moves to the next account where the model is free. Without
+    `model_switch` (a wrapper older than model fallbacks) only account moves are offered."""
+    fallback = model_switch and model and cfg["model_fallbacks"].get(model)
     if fallback:
         model = model_family(fallback)
         if model_limited_until(state, account, model) <= now:
@@ -433,7 +434,10 @@ def signal_limit(account, run, message, source):
 
         def record(state):
             model, until = record_limit(state, account, message, now, cfg)
-            return model, until, switch_for(cfg, state, account, now, model)
+            # Hooks always run this file, but a wrapper started before model fallbacks keeps its
+            # old code: asking it to stop for a model switch would end the session instead.
+            model_switch = bool(os.environ.get("CLAUDE_ROTATE_MODEL_SWITCH"))
+            return model, until, switch_for(cfg, state, account, now, model, model_switch)
 
         model, until, target = with_state(record)
         session = read_json(RUNS / f"{run}.session.json", {})
@@ -882,7 +886,8 @@ def cmd_run(args):
         try:
             prepare_account(account, prev)
             env = account_env(account)
-            env.update(CLAUDE_ROTATE_ACCOUNT=account, CLAUDE_ROTATE_RUN=run)
+            env.update(CLAUDE_ROTATE_ACCOUNT=account, CLAUDE_ROTATE_RUN=run,
+                       CLAUDE_ROTATE_MODEL_SWITCH="1")
             info(f"account {account} ({account_email(account) or 'not signed in'})")
             started = time.time()
             runner = run_terminal if not printing and sys.stdin.isatty() and sys.stdout.isatty() else run_once
