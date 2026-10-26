@@ -215,6 +215,28 @@ class Helpers(unittest.TestCase):
         self.assertEqual([e["reason"] for e in events if e["run"] == run and e["event"] == "limit_ignored"],
                          ["already_signalled"])
 
+    def test_account_move_switches_when_session_model_is_limited_there(self):
+        cfg = {"order": ["default", "a"], "model_fallbacks": {"fable": "claude-opus-5-5"}}
+        (self.m.ACCOUNTS / "a").mkdir(parents=True, exist_ok=True)
+        far = {"limited_until": 10**12}
+        state = {"a": {"models": {"fable": far}}}
+        move = lambda current: self.m.switch_for(cfg, state, "default", 0, None, current=current)
+        self.assertEqual(move("claude-fable-5-1"), ("a", "claude-opus-5-5"))
+        self.assertEqual(move("claude-opus-5-5"), ("a", None))
+        self.assertEqual(move(None), ("a", None))
+        state["a"]["models"]["opus"] = far
+        self.assertEqual(move("claude-fable-5-1"), ("a", None))
+
+    def test_session_model_reads_latest_main_reply(self):
+        t = Path(self.tmp.name) / "model.jsonl"
+        reply = lambda model, **extra: {"type": "assistant", "message": {"model": model}, **extra}
+        t.write_text("\n".join(json.dumps(e) for e in [
+            reply("claude-opus-5-5"), reply("claude-fable-5-1"),
+            reply("claude-sonnet-5-5", isSidechain=True), reply("<synthetic>", isApiErrorMessage=True),
+        ]) + "\n")
+        self.assertEqual(self.m.session_model(t), "claude-fable-5-1")
+        self.assertIsNone(self.m.session_model(None))
+
     def test_pick_next_skips_limited(self):
         cfg = {"order": ["default", "a", "b"]}
         (self.m.ACCOUNTS / "a").mkdir(parents=True, exist_ok=True)
@@ -420,6 +442,18 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("resumed on claude-opus-5-5", prompt)
         self.assertIn("with claude-opus-5-5", r.stderr)
         self.assertIn("fable", self.state()["default"]["models"])
+
+    def test_weekly_limit_moves_fable_session_onto_opus_when_fable_is_limited_there(self):
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "state.json").write_text(json.dumps(
+            {"dev": {"models": {"fable": {"limited_until": 10**12, "recorded_at": 0}}}}))
+        r = self.rotate([], MOCK_LIMITED="default", MOCK_REPLY_MODEL="claude-fable-5-1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        inv = self.invocations()
+        self.assertEqual([i["account"] for i in inv], ["default", "dev"])
+        second = inv[1]["argv"]
+        self.assertEqual(second[second.index("--model") + 1], "claude-opus-5-5")
+        self.assertIn("resumed on another account", second[second.index("--") + 1])
 
     def test_subagent_fable_limit_leaves_parent_running(self):
         r = self.rotate([], MOCK_LIMITED="default", MOCK_NO_TRANSCRIPT_ERROR="1",

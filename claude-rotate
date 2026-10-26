@@ -19,7 +19,8 @@ A limit that names one model ("You've reached your Fable limit") is recorded for
 the account stays usable and new sessions prefer accounts with no model limit. A session that hits
 it is resumed with the model in model_fallbacks (Fable -> Opus 5.5), on the same account unless the
 fallback is limited there too; a model without a fallback moves the session to an account where
-that model is free. A subagent's limit on
+that model is free. An account move switches to the fallback up front when the session's own model
+is limited on the next account. A subagent's limit on
 a model with a fallback is only recorded, since the parent's own model is unaffected. Such messages
 carry no reset time, so the limit is assumed to last model_cooldown_hours, and it is dropped early
 once a transcript shows that model answering on the account again. Subagent transcripts are scanned
@@ -393,18 +394,27 @@ def pick_next(cfg, state, current, now, model=None):
     return None
 
 
-def switch_for(cfg, state, account, now, model, model_switch=True):
+def switch_for(cfg, state, account, now, model, model_switch=True, current=None):
     """Where a session resumes after a limit: (account, model to switch to or None), or None.
     A model limit with a fallback switches to it, on this account unless the fallback is limited
-    here too; any other limit moves to the next account where the model is free. Without
-    `model_switch` (a wrapper older than model fallbacks) only account moves are offered."""
+    here too; any other limit moves to the next account where the model is free. When `current`,
+    the session's model, is limited on that account, the move switches to its fallback up front
+    rather than failing there once. Without `model_switch` (a wrapper older than model fallbacks)
+    only account moves are offered."""
     fallback = model_switch and model and cfg["model_fallbacks"].get(model)
     if fallback:
         model = model_family(fallback)
         if model_limited_until(state, account, model) <= now:
             return account, fallback
     nxt = pick_next(cfg, state, account, now, model)
-    return (nxt, fallback or None) if nxt else None
+    if not nxt:
+        return None
+    family = model_family(current)
+    alt = model_switch and not fallback and family and cfg["model_fallbacks"].get(family)
+    if (alt and model_limited_until(state, nxt, family) > now
+            and model_limited_until(state, nxt, model_family(alt)) <= now):
+        return nxt, alt
+    return nxt, fallback or None
 
 
 def fmt_time(ts):
@@ -512,6 +522,25 @@ def limit_message(transcript_path, sidechain=False):
             content = (entry.get("message") or {}).get("content") or []
             return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
         return None
+    return None
+
+
+def session_model(transcript_path):
+    """The model of the session's latest reply ("claude-fable-5-1"), or None."""
+    try:
+        lines = read_lines(transcript_path)
+    except (OSError, TypeError):
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(entry, dict) and entry.get("type") == "assistant"
+                and not entry.get("isSidechain") and not entry.get("isApiErrorMessage")):
+            model = (entry.get("message") or {}).get("model") or ""
+            if model.startswith("claude-"):
+                return model
     return None
 
 
@@ -910,13 +939,14 @@ def cmd_run(args):
             if message is None:
                 return code
             now = time.time()
+            current = session and session_model(session.get("transcript_path"))
 
             def record(state):
                 if evidence:
                     model, until = evidence["model"], evidence["limited_until"]
                 else:
                     model, until = record_limit(state, account, message, now, cfg)
-                return model, until, switch_for(cfg, state, account, now, model)
+                return model, until, switch_for(cfg, state, account, now, model, current=current)
 
             model, until, target = with_state(record)
             info(f"{account} hit its {model.title() + ' ' if model else 'usage '}limit "
@@ -933,8 +963,9 @@ def cmd_run(args):
             prev, account, cwd = account, nxt, session.get("cwd") or cwd
             info(f"resuming session {sid} on {account}" + (f" with {switch}" if switch else ""))
             log_event(run, prev, "resuming", session_id=sid, next_account=account, next_model=switch)
+            # A switch after an account-wide limit is part of the move, so the move's prompt fits.
             prompt = (cfg["model_switch_prompt"].format(model=model.title(), fallback=switch)
-                      if switch else cfg["continue_prompt"])
+                      if switch and model else cfg["continue_prompt"])
             parts = resume_parts(parts, sid, prompt, switch)
         finally:
             for suffix in (".stop", ".session.json", ".limit.json", ".lock"):

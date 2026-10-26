@@ -162,7 +162,9 @@ limit. Terminal banners without a model name are treated as account-wide limits.
 A session that hits a model limit listed in `model_fallbacks` (default
 `{"fable": "claude-opus-5-5"}`) is resumed with `--model <fallback>` and `model_switch_prompt`,
 replacing any `--model` you passed: on the same account, or on the next account where the fallback
-is free when it is limited here too. A model with no fallback moves the
+is free when it is limited here too. An account move (for example a weekly limit) also switches
+to the fallback up front when the session's own model, read from its latest reply, is limited on
+the next account. A model with no fallback moves the
 session to the next account where that model is free. A subagent's limit on a model that has a
 fallback is recorded but does not restart the parent, whose own model is a separate choice.
 
