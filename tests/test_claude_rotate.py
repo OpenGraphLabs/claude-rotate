@@ -190,6 +190,10 @@ class Helpers(unittest.TestCase):
                     self.m.signal_limit("default", run, FABLE_TEXT, "StopFailure")
                 self.assertEqual((self.m.RUNS / f"{run}.stop").exists(), stops)
                 self.assertTrue((self.m.RUNS / f"{run}.limit.json").exists())
+                events = [json.loads(line) for line in
+                          (self.m.HOME / "events.jsonl").read_text().splitlines()]
+                old = [e for e in events if e["run"] == run and e["event"] == "old_wrapper"]
+                self.assertEqual([e["withheld"] for e in old], [] if flag else ["claude-opus-5-5"])
 
     def test_hook_ignores_evidence_from_an_earlier_launch(self):
         # Wrappers older than per-launch run ids reuse the run id and leave limit.json behind.
@@ -202,11 +206,14 @@ class Helpers(unittest.TestCase):
             self.m.signal_limit("default", run, FABLE_TEXT, "StopFailure")
         self.assertEqual(self.m.read_json(evidence, {})["message"], FABLE_TEXT)
         self.assertTrue((self.m.RUNS / f"{run}.stop").exists())
-        # Within one launch the first signal still wins.
+        # Within one launch the first signal still wins, and the ignored one is logged.
         (self.m.RUNS / f"{run}.stop").unlink()
         self.m.signal_limit("default", run, LIMIT_TEXT, "StopFailure")
         self.assertEqual(self.m.read_json(evidence, {})["message"], FABLE_TEXT)
         self.assertFalse((self.m.RUNS / f"{run}.stop").exists())
+        events = [json.loads(line) for line in (self.m.HOME / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([e["reason"] for e in events if e["run"] == run and e["event"] == "limit_ignored"],
+                         ["already_signalled"])
 
     def test_pick_next_skips_limited(self):
         cfg = {"order": ["default", "a", "b"]}

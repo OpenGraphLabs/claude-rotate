@@ -432,14 +432,15 @@ def signal_limit(account, run, message, source):
         # evidence older than the latest SessionStart is from an earlier launch and does not count.
         if evidence_file.exists() and (not session_file.exists()
                                        or evidence_file.stat().st_mtime >= session_file.stat().st_mtime):
+            log_event(run, account, "limit_ignored", source=source, reason="already_signalled")
             return
         now, cfg = time.time(), load_config()
+        # Hooks always run this file, but a wrapper started before model fallbacks keeps its old
+        # code: asking it to stop for a model switch would end the session instead.
+        model_switch = bool(os.environ.get("CLAUDE_ROTATE_MODEL_SWITCH"))
 
         def record(state):
             model, until = record_limit(state, account, message, now, cfg)
-            # Hooks always run this file, but a wrapper started before model fallbacks keeps its
-            # old code: asking it to stop for a model switch would end the session instead.
-            model_switch = bool(os.environ.get("CLAUDE_ROTATE_MODEL_SWITCH"))
             return model, until, switch_for(cfg, state, account, now, model, model_switch)
 
         model, until, target = with_state(record)
@@ -447,6 +448,9 @@ def signal_limit(account, run, message, source):
         log_event(run, account, "limit_detected", source=source, model=model,
                   limited_until=until, session_id=session.get("session_id"),
                   next_account=target and target[0], next_model=target and target[1])
+        if not model_switch and model and cfg["model_fallbacks"].get(model):
+            log_event(run, account, "old_wrapper", reason="no_model_switch",
+                      withheld=cfg["model_fallbacks"][model])
         if target and target[1] and source == "SubagentStop":
             log_event(run, account, "rotation_skipped", reason="subagent_model_limit")
             return
