@@ -71,6 +71,12 @@ def main(argv):
                 "message": {"role": "assistant", "model": "claude-opus-5-5",
                             "content": [{"type": "text", "text": os.environ["MOCK_BANNER"]}]},
             }, ensure_ascii=False) + "\n")
+        if os.environ.get("MOCK_REPLY_MODEL"):
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": {"role": "assistant", "model": os.environ["MOCK_REPLY_MODEL"],
+                            "content": [{"type": "text", "text": "earlier reply"}]},
+            }) + "\n")
         if limited and not os.environ.get("MOCK_NO_TRANSCRIPT_ERROR"):
             f.write(json.dumps({
                 "type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
