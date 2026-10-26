@@ -427,8 +427,11 @@ def signal_limit(account, run, message, source):
     RUNS.mkdir(parents=True, exist_ok=True)
     with open(RUNS / f"{run}.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        evidence_file = RUNS / f"{run}.limit.json"
-        if evidence_file.exists():
+        evidence_file, session_file = RUNS / f"{run}.limit.json", RUNS / f"{run}.session.json"
+        # A wrapper older than per-launch run ids keeps one run id and never deletes this file, so
+        # evidence older than the latest SessionStart is from an earlier launch and does not count.
+        if evidence_file.exists() and (not session_file.exists()
+                                       or evidence_file.stat().st_mtime >= session_file.stat().st_mtime):
             return
         now, cfg = time.time(), load_config()
 
@@ -440,7 +443,7 @@ def signal_limit(account, run, message, source):
             return model, until, switch_for(cfg, state, account, now, model, model_switch)
 
         model, until, target = with_state(record)
-        session = read_json(RUNS / f"{run}.session.json", {})
+        session = read_json(session_file, {})
         log_event(run, account, "limit_detected", source=source, model=model,
                   limited_until=until, session_id=session.get("session_id"),
                   next_account=target and target[0], next_model=target and target[1])
