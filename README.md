@@ -15,7 +15,8 @@ the conversation over. `claude-rotate` is a single-file Python wrapper that:
   terminal banner (including the banner that has no corresponding API error),
   records when that account resets, and relaunches `claude --resume <session>` on the next free
   account with a short "continue where you left off" prompt;
-- does the same for `claude -p` (print mode) runs after they exit.
+- does the same for `claude -p` (print mode) runs after they exit;
+- shows each account's 5-hour and 7-day usage as bars in `claude-rotate account list`.
 
 Works on macOS and Linux with Python 3.9+ and Claude Code 2.1.x. Only use accounts you are
 entitled to use under Anthropic's terms.
@@ -82,6 +83,8 @@ Five steps, about two minutes. Assumes `claude` is installed and signed in to yo
 
 - **Which account am I on?** The `[claude-rotate] account ...` line at the top of every session,
   or `claude-rotate account list` from another terminal.
+- **How much of each account is used?** `claude-rotate account list` draws it once your status
+  line feeds the wrapper; see [Usage bars](#usage-bars).
 - **An account is marked limited but I know it has reset.** `claude-rotate account reset NAME`
   clears the record. The wrapper only trusts the reset time printed in the limit message; when
   it cannot parse one it waits `cooldown_minutes` (default 60) before trying that account again.
@@ -99,14 +102,60 @@ Five steps, about two minutes. Assumes `claude` is installed and signed in to yo
   (`CLAUDE_CONFIG_DIR=~/.claude-accounts/accounts/NAME command claude auth logout`), then delete
   `~/.claude-accounts/accounts/NAME` and remove it from `order` in `config.json`.
 
+## Usage bars
+
+`claude-rotate account list` draws each account's 5-hour and 7-day usage:
+
+```
+default          you@company.com                      limited until 11-03 02:00
+                 7d  ████████████████████  100%  resets 11-03 02:00 · read 11-02 20:14
+personal         you@gmail.com                        available
+                 5h  ███████░░░░░░░░░░░░░   35%  resets 11-02 23:00 · read 11-02 22:31
+                 7d  ███░░░░░░░░░░░░░░░░░   14%  resets 11-07 10:00 · read 11-02 22:31
+```
+
+Claude Code hands these numbers (`rate_limits.five_hour` / `seven_day`: percent used and reset
+time) only to the [statusLine](https://code.claude.com/docs/en/statusline) command, so
+that command has to pass them on. The wrapper does not set `statusLine` itself, because
+`--settings` would replace yours.
+
+- **No status line yet.** In `~/.claude/settings.json`:
+
+  ```json
+  "statusLine": {"type": "command", "command": "claude-rotate account statusline"}
+  ```
+
+  The status line then reads `5h 35% · 7d 14%`.
+
+- **Your own status line script.** Give it the same payload and ignore the output:
+
+  ```sh
+  payload=$(cat)
+  printf '%s' "$payload" | claude-rotate account statusline >/dev/null 2>&1
+  # ... the rest of your script reads "$payload"
+  ```
+
+What the bars mean:
+
+- A reading belongs to the account in `CLAUDE_ROTATE_ACCOUNT`, which the wrapper sets for the
+  session. Sessions started with `command claude` are not recorded.
+- Only interactive sessions draw a status line, and Claude Code redraws it as the conversation
+  changes. An account nobody has used since shows its last reading and when it was taken
+  (`read ...`). A window whose reset time has passed shows 0 % and "no reading since".
+- Several sessions on one account each report what they last heard from the API, so the highest
+  reading of a window wins until the window resets.
+- Claude Code passes a window only while the API reports it, so an account may show `7d` alone.
+- Bars turn yellow at 70 % and red at 90 % on a terminal; set `NO_COLOR` to turn colour off.
+
 ## Command reference
 
 ```
 claude-rotate [claude args...]                  run claude on the first account that is not limited
 claude-rotate account add NAME [--email E] [--no-login]
 claude-rotate account login NAME [--email E]    sign in (again) on an existing account
-claude-rotate account list
+claude-rotate account list                      accounts, recorded limits and usage bars
 claude-rotate account reset [NAME]              forget recorded limits
+claude-rotate account statusline                statusLine command: record and print session usage
 claude-rotate account help
 ```
 
@@ -183,6 +232,7 @@ Files:
   config.json     order, cooldown_minutes, model_cooldown_hours, model_fallbacks,
                   continue_prompt, model_switch_prompt
   state.json      per-account limited_until + the limit message
+  usage.json      per-account 5h/7d usage readings from the status line
   accounts/<n>/   CLAUDE_CONFIG_DIR of each extra account
   runs/           per-launch session and limit evidence while a wrapper is running
   events.jsonl    session start, limit source, selection and resume/skip diagnostics
