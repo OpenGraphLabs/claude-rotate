@@ -26,12 +26,17 @@ carry no reset time, so the limit is assumed to last model_cooldown_hours, and i
 once a transcript shows that model answering on the account again. Subagent transcripts are scanned
 for these limits on exit too.
 
+`account list` also draws each account's 5-hour and 7-day usage as bars. Claude Code hands those
+numbers only to the statusLine command, so `claude-rotate account statusline` is meant to run there:
+it records the reading for the account the wrapper launched (CLAUDE_ROTATE_ACCOUNT) and prints it.
+
 usage:
   claude-rotate [claude args...]              run claude on the first account that is not limited
   claude-rotate account add NAME [--email E] [--no-login]
   claude-rotate account login NAME [--email E]
-  claude-rotate account list
+  claude-rotate account list                  accounts, recorded limits and usage bars
   claude-rotate account reset [NAME]          forget recorded limits
+  claude-rotate account statusline            statusLine command: record and print session usage
   claude-rotate account help                  print this text
   claude-rotate auth|mcp|... [args]           claude subcommands run on the main login, unchanged
 
@@ -69,6 +74,7 @@ ACCOUNTS = HOME / "accounts"
 RUNS = HOME / "runs"
 CONFIG = HOME / "config.json"
 STATE = HOME / "state.json"
+USAGE = HOME / "usage.json"
 SELF = os.path.realpath(__file__)
 DEFAULT = "default"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -140,6 +146,9 @@ SUBCOMMANDS = {
     "plugin", "plugins", "purge", "respawn", "rm", "sessions", "setup-token", "stop", "kill",
     "ultrareview", "update", "upgrade",
 }
+# Rate-limit windows of the statusLine payload, in display order: (payload key, label).
+USAGE_WINDOWS = [("five_hour", "5h"), ("seven_day", "7d")]
+BAR_WIDTH = 20
 # Flags that choose or create the conversation; the wrapper drops them when it resumes a session.
 SESSION_FLAGS = {
     "-c", "--continue", "-r", "--resume", "--session-id", "--fork-session", "--from-pr",
@@ -180,15 +189,20 @@ def save_config(cfg):
     write_json(CONFIG, cfg, mode=0o644)
 
 
-def with_state(fn):
-    """Read-modify-write state.json under a lock; returns fn(state)."""
+def update_json(path, fn):
+    """Read-modify-write a JSON file in HOME under the shared lock; returns fn(data)."""
     HOME.mkdir(parents=True, exist_ok=True)
     with open(HOME / ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        state = read_json(STATE, {})
-        result = fn(state)
-        write_json(STATE, state)
+        data = read_json(path, {})
+        result = fn(data)
+        write_json(path, data)
         return result
+
+
+def with_state(fn):
+    """Read-modify-write state.json under a lock; returns fn(state)."""
+    return update_json(STATE, fn)
 
 
 def main_json():
@@ -1004,8 +1018,72 @@ def cmd_login(name, email):
     return code
 
 
+def usage_readings(rate_limits):
+    """(key, label, used_percentage, resets_at) for each window a statusLine payload reports."""
+    for key, label in USAGE_WINDOWS:
+        reading = rate_limits.get(key) or {}
+        pct, resets = reading.get("used_percentage"), reading.get("resets_at")
+        if isinstance(pct, (int, float)) and isinstance(resets, (int, float)):
+            yield key, label, pct, resets
+
+
+def merge_usage(windows, rate_limits, now):
+    """Fold one statusLine reading into an account's stored windows. Usage only grows within a
+    window, and a session that last heard from the API earlier still reports its older number, so
+    the highest reading of a window wins and a reading of an earlier window is dropped."""
+    for key, _, pct, resets in usage_readings(rate_limits):
+        old = windows.get(key)
+        if old is None or resets > old["resets_at"] or (
+                resets == old["resets_at"] and pct >= old["used_percentage"]):
+            windows[key] = {"used_percentage": pct, "resets_at": resets, "read_at": now}
+
+
+def usage_text(rate_limits):
+    """Compact form for a status line, e.g. "5h 35% · 7d 81%"."""
+    return " · ".join(f"{label} {pct:.0f}%" for _, label, pct, _ in usage_readings(rate_limits))
+
+
+def cmd_statusline():
+    payload = json.load(sys.stdin)
+    rate_limits = payload.get("rate_limits") or {}
+    account, now = os.environ.get("CLAUDE_ROTATE_ACCOUNT"), time.time()
+    if account and rate_limits:
+        update_json(USAGE, lambda u: merge_usage(u.setdefault(account, {}), rate_limits, now))
+    text = usage_text(rate_limits)
+    if text:
+        print(text)
+    return 0
+
+
+def usage_bar(pct, color):
+    filled = max(0, min(BAR_WIDTH, round(pct * BAR_WIDTH / 100)))
+    done = "█" * filled
+    if color and filled:
+        done = f"\x1b[{31 if pct >= 90 else 33 if pct >= 70 else 32}m{done}\x1b[0m"
+    return done + "░" * (BAR_WIDTH - filled)
+
+
+def usage_lines(windows, now, color=False):
+    """`account list` lines for one account: a bar per window with its reset and reading time."""
+    lines = []
+    for key, label in USAGE_WINDOWS:
+        w = windows.get(key)
+        if not w:
+            continue
+        if w["resets_at"] <= now:
+            lines.append(f"{label}  {usage_bar(0, color)}    0%  reset {fmt_time(w['resets_at'])}, "
+                         "no reading since")
+        else:
+            pct = w["used_percentage"]
+            lines.append(f"{label}  {usage_bar(pct, color)}  {pct:>3.0f}%  resets "
+                         f"{fmt_time(w['resets_at'])} · read {fmt_time(w['read_at'])}")
+    return lines or ["no usage reading yet"]
+
+
 def cmd_list():
     cfg, state, now = load_config(), read_json(STATE, {}), time.time()
+    usage = read_json(USAGE, {})
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     for name in cfg["order"]:
         if name != DEFAULT and not (ACCOUNTS / name).is_dir():
             status = "missing directory"
@@ -1016,6 +1094,8 @@ def cmd_list():
         for model in active_models(state, name, now):
             status += f"; {model} limited until {fmt_time(model_limited_until(state, name, model))}"
         print(f"{name:<16} {account_email(name) or 'not signed in':<36} {status}")
+        for line in usage_lines(usage.get(name, {}), now, color):
+            print(f"{'':<17}{line}")
     return 0
 
 
@@ -1042,6 +1122,8 @@ def cmd_account(argv):
         return cmd_list()
     if sub == "reset" and len(rest) <= 1:
         return cmd_reset(rest[0] if rest else None)
+    if sub == "statusline" and not rest:
+        return cmd_statusline()
     print(__doc__, file=sys.stderr if sub != "help" else sys.stdout)
     return 0 if sub == "help" else 2
 

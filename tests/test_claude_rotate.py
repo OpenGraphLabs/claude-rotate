@@ -246,6 +246,36 @@ class Helpers(unittest.TestCase):
         self.assertEqual(self.m.pick_next(cfg, state, "b", 0), "default")
         self.assertIsNone(self.m.pick_next(cfg, {"default": {"limited_until": 10**12}, **state}, "b", 0))
 
+    def test_merge_usage_keeps_highest_reading_per_window(self):
+        windows = {}
+        self.m.merge_usage(windows, {"seven_day": {"used_percentage": 35, "resets_at": 2000}}, 10)
+        # Another session that last heard from the API earlier: same window, lower number.
+        self.m.merge_usage(windows, {"seven_day": {"used_percentage": 20, "resets_at": 2000}}, 11)
+        self.assertEqual(windows["seven_day"],
+                         {"used_percentage": 35, "resets_at": 2000, "read_at": 10})
+        self.m.merge_usage(windows, {"seven_day": {"used_percentage": 35, "resets_at": 2000}}, 12)
+        self.assertEqual(windows["seven_day"]["read_at"], 12)
+        # The window reset: the new, lower number replaces it; a reading of the old window does not.
+        self.m.merge_usage(windows, {"seven_day": {"used_percentage": 3, "resets_at": 9000},
+                                     "five_hour": {"used_percentage": 50, "resets_at": 3000}}, 13)
+        self.m.merge_usage(windows, {"seven_day": {"used_percentage": 40, "resets_at": 2000},
+                                     "five_hour": {"used_percentage": None}}, 14)
+        self.assertEqual(windows, {
+            "seven_day": {"used_percentage": 3, "resets_at": 9000, "read_at": 13},
+            "five_hour": {"used_percentage": 50, "resets_at": 3000, "read_at": 13}})
+
+    def test_usage_lines_draw_bars_and_expired_windows(self):
+        lines = self.m.usage_lines({
+            "five_hour": {"used_percentage": 35, "resets_at": 50, "read_at": 1},
+            "seven_day": {"used_percentage": 100, "resets_at": 500, "read_at": 1}}, now=100)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("5h  " + "\u2591" * 20 + "    0%  reset "), lines[0])
+        self.assertTrue(lines[0].endswith("no reading since"))
+        self.assertTrue(lines[1].startswith("7d  " + "\u2588" * 20 + "  100%  resets "), lines[1])
+        self.assertEqual(self.m.usage_lines({}, now=100), ["no usage reading yet"])
+        self.assertEqual(self.m.usage_bar(35, False), "\u2588" * 7 + "\u2591" * 13)
+        self.assertIn("\x1b[31m", self.m.usage_bar(95, True))
+
     def test_banner_across_utf8_and_ansi_boundaries(self):
         detector = self.m.TerminalLimitDetector()
         found = [message for byte in BANNER.encode()
@@ -308,10 +338,10 @@ class EndToEnd(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def rotate(self, args, **extra):
+    def rotate(self, args, input=None, **extra):
         env = {**self.env, **extra}
         return subprocess.run([sys.executable, str(SCRIPT), *args], env=env, cwd=self.cwd,
-                              capture_output=True, text=True, timeout=60)
+                              input=input, capture_output=True, text=True, timeout=60)
 
     def rotate_tty(self, *, callback=None, **extra):
         master, slave = pty.openpty()
@@ -572,6 +602,33 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertEqual([i["account"] for i in self.invocations()], ["default"])
         self.assertIn("default", self.state())  # the limit is still recorded for next time
+
+    def test_statusline_records_usage_for_the_wrapper_account(self):
+        resets = int(time.time()) + 3600
+
+        def payload(five_hour):
+            return json.dumps({"session_id": "s", "rate_limits": {
+                "five_hour": {"used_percentage": five_hour, "resets_at": resets},
+                "seven_day": {"used_percentage": 81.4, "resets_at": resets + 86400}}})
+
+        r = self.rotate(["account", "statusline"], input=payload(35), CLAUDE_ROTATE_ACCOUNT="dev")
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "5h 35% \u00b7 7d 81%\n", ""))
+        # Plain `command claude` sets no CLAUDE_ROTATE_ACCOUNT: printed, not recorded.
+        r = self.rotate(["account", "statusline"], input=payload(99))
+        self.assertEqual(r.stdout, "5h 99% \u00b7 7d 81%\n")
+        # No subscription limits (API key): nothing to print or record.
+        r = self.rotate(["account", "statusline"], input='{"session_id": "s"}',
+                        CLAUDE_ROTATE_ACCOUNT="default")
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+        usage = json.loads((self.home / "usage.json").read_text())
+        self.assertEqual(sorted(usage), ["dev"])
+        self.assertEqual(usage["dev"]["five_hour"]["used_percentage"], 35)
+        lines = self.rotate(["account", "list"]).stdout.splitlines()
+        self.assertEqual(lines[1].strip(), "no usage reading yet")
+        self.assertTrue(lines[2].startswith("dev "), lines)
+        indent = " " * 17
+        self.assertTrue(lines[3].startswith(f"{indent}5h  {'█' * 7}{'░' * 13}   35%"), lines)
+        self.assertTrue(lines[4].startswith(f"{indent}7d  {'█' * 16}{'░' * 4}   81%"), lines)
 
     def test_subcommands_run_on_main_login_without_hooks(self):
         r = self.rotate(["auth", "status"], CLAUDE_CONFIG_DIR="/should/be/dropped")
