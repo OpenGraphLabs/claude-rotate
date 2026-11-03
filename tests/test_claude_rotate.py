@@ -264,15 +264,28 @@ class Helpers(unittest.TestCase):
             "seven_day": {"used_percentage": 3, "resets_at": 9000, "read_at": 13},
             "five_hour": {"used_percentage": 50, "resets_at": 3000, "read_at": 13}})
 
-    def test_usage_lines_draw_bars_and_expired_windows(self):
+    def test_usage_lines_show_empty_windows_as_zero(self):
+        # The 5h reading has reset; the 7d one is live.
         lines = self.m.usage_lines({
             "five_hour": {"used_percentage": 35, "resets_at": 50, "read_at": 1},
-            "seven_day": {"used_percentage": 100, "resets_at": 500, "read_at": 1}}, now=100)
-        self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[0].startswith("5h  " + "\u2591" * 20 + "    0%  reset "), lines[0])
-        self.assertTrue(lines[0].endswith("no reading since"))
-        self.assertTrue(lines[1].startswith("7d  " + "\u2588" * 20 + "  100%  resets "), lines[1])
-        self.assertEqual(self.m.usage_lines({}, now=100), ["no usage reading yet"])
+            "seven_day": {"used_percentage": 64, "resets_at": 500, "read_at": 1}}, None, now=100)
+        self.assertEqual(lines[0], "5h  " + "░" * 20 + "    0%")
+        self.assertTrue(lines[1].startswith("7d  " + "█" * 13 + "░" * 7 + "   64%  resets "), lines[1])
+        self.assertEqual(self.m.usage_lines({}, None, now=100),
+                         ["5h  " + "░" * 20 + "    0%", "7d  " + "░" * 20 + "    0%"])
+
+    def test_usage_lines_fill_the_window_a_limit_names(self):
+        weekly = {"message": LIMIT_TEXT, "limited_until": 500, "recorded_at": 90}
+        lines = self.m.usage_lines({}, weekly, now=100)
+        self.assertEqual(lines[0], "5h  " + "░" * 20 + "    0%")
+        self.assertTrue(lines[1].startswith("7d  " + "█" * 20 + "  100%  resets "), lines[1])
+        self.assertIn("limit hit", lines[1])
+        session = {"message": "You've hit your session limit · resets 3pm", "limited_until": 500,
+                   "recorded_at": 90}
+        self.assertEqual(self.m.limit_window(session, 100), "five_hour")
+        self.assertIsNone(self.m.limit_window(weekly, 600))  # the limit has ended
+        unnamed = {"message": "Rate limit reached", "limited_until": 500}
+        self.assertIsNone(self.m.limit_window(unnamed, 100))
         self.assertEqual(self.m.usage_bar(35, False), "\u2588" * 7 + "\u2591" * 13)
         self.assertIn("\x1b[31m", self.m.usage_bar(95, True))
 
@@ -624,11 +637,11 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(sorted(usage), ["dev"])
         self.assertEqual(usage["dev"]["five_hour"]["used_percentage"], 35)
         lines = self.rotate(["account", "list"]).stdout.splitlines()
-        self.assertEqual(lines[1].strip(), "no usage reading yet")
-        self.assertTrue(lines[2].startswith("dev "), lines)
         indent = " " * 17
-        self.assertTrue(lines[3].startswith(f"{indent}5h  {'█' * 7}{'░' * 13}   35%"), lines)
-        self.assertTrue(lines[4].startswith(f"{indent}7d  {'█' * 16}{'░' * 4}   81%"), lines)
+        self.assertEqual(lines[1:3], [f"{indent}5h  {'░' * 20}    0%", f"{indent}7d  {'░' * 20}    0%"])
+        self.assertTrue(lines[3].startswith("dev "), lines)
+        self.assertTrue(lines[4].startswith(f"{indent}5h  {'█' * 7}{'░' * 13}   35%"), lines)
+        self.assertTrue(lines[5].startswith(f"{indent}7d  {'█' * 16}{'░' * 4}   81%"), lines)
 
     def test_subcommands_run_on_main_login_without_hooks(self):
         r = self.rotate(["auth", "status"], CLAUDE_CONFIG_DIR="/should/be/dropped")
