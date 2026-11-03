@@ -108,7 +108,8 @@ Five steps, about two minutes. Assumes `claude` is installed and signed in to yo
 
 ```
 default          you@company.com                      limited until 11-03 02:00
-                 7d  ████████████████████  100%  resets 11-03 02:00 · read 11-02 20:14
+                 5h  ░░░░░░░░░░░░░░░░░░░░    0%
+                 7d  ████████████████████  100%  resets 11-03 02:00 · limit hit 11-02 20:14
 personal         you@gmail.com                        available
                  5h  ███████░░░░░░░░░░░░░   35%  resets 11-02 23:00 · read 11-02 22:31
                  7d  ███░░░░░░░░░░░░░░░░░   14%  resets 11-07 10:00 · read 11-02 22:31
@@ -141,10 +142,14 @@ What the bars mean:
   session. Sessions started with `command claude` are not recorded.
 - Only interactive sessions draw a status line, and Claude Code redraws it as the conversation
   changes. An account nobody has used since shows its last reading and when it was taken
-  (`read ...`). A window whose reset time has passed shows 0 % and "no reading since".
+  (`read ...`).
+- A window with no reading, or whose reading has reset, shows 0 %. Claude Code passes a window
+  only while the API reports one; Claude's usage data gives a 5-hour window that has not started
+  as 0 % with no reset time.
+- A window the account's recorded limit names ("You've hit your weekly limit", "... 5-hour
+  limit", "... session limit") shows 100 % until that limit ends (`limit hit ...`).
 - Several sessions on one account each report what they last heard from the API, so the highest
   reading of a window wins until the window resets.
-- Claude Code passes a window only while the API reports it, so an account may show `7d` alone.
 - Bars turn yellow at 70 % and red at 90 % on a terminal; set `NO_COLOR` to turn colour off.
 
 ## Command reference

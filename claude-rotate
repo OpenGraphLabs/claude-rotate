@@ -148,6 +148,9 @@ SUBCOMMANDS = {
 }
 # Rate-limit windows of the statusLine payload, in display order: (payload key, label).
 USAGE_WINDOWS = [("five_hour", "5h"), ("seven_day", "7d")]
+# How an account-wide limit message names its window ("You've hit your weekly limit · resets ..."),
+# as Claude Code itself matches them.
+LIMIT_WINDOWS = {"five_hour": ("5-hour limit", "session limit"), "seven_day": ("weekly limit",)}
 BAR_WIDTH = 20
 # Flags that choose or create the conversation; the wrapper drops them when it resumes a session.
 SESSION_FLAGS = {
@@ -1063,21 +1066,33 @@ def usage_bar(pct, color):
     return done + "░" * (BAR_WIDTH - filled)
 
 
-def usage_lines(windows, now, color=False):
-    """`account list` lines for one account: a bar per window with its reset and reading time."""
-    lines = []
+def limit_window(limit, now):
+    """The window an account's active account-wide limit names, else None."""
+    if not limit or limit.get("limited_until", 0) <= now:
+        return None
+    message = limit.get("message", "")
+    for key, names in LIMIT_WINDOWS.items():
+        if any(f"hit your {name}" in message for name in names):
+            return key
+    return None
+
+
+def usage_lines(windows, limit, now, color=False):
+    """`account list` lines for one account, a bar per window. A window the account's active limit
+    names is full; one with no reading, or whose reading has reset, is empty."""
+    full, lines = limit_window(limit, now), []
     for key, label in USAGE_WINDOWS:
         w = windows.get(key)
-        if not w:
-            continue
-        if w["resets_at"] <= now:
-            lines.append(f"{label}  {usage_bar(0, color)}    0%  reset {fmt_time(w['resets_at'])}, "
-                         "no reading since")
+        if key == full:
+            pct, note = 100, (f"resets {fmt_time(limit['limited_until'])} · "
+                              f"limit hit {fmt_time(limit['recorded_at'])}")
+        elif w and w["resets_at"] > now:
+            pct, note = w["used_percentage"], (f"resets {fmt_time(w['resets_at'])} · "
+                                               f"read {fmt_time(w['read_at'])}")
         else:
-            pct = w["used_percentage"]
-            lines.append(f"{label}  {usage_bar(pct, color)}  {pct:>3.0f}%  resets "
-                         f"{fmt_time(w['resets_at'])} · read {fmt_time(w['read_at'])}")
-    return lines or ["no usage reading yet"]
+            pct, note = 0, ""
+        lines.append(f"{label}  {usage_bar(pct, color)}  {pct:>3.0f}%  {note}".rstrip())
+    return lines
 
 
 def cmd_list():
@@ -1094,7 +1109,7 @@ def cmd_list():
         for model in active_models(state, name, now):
             status += f"; {model} limited until {fmt_time(model_limited_until(state, name, model))}"
         print(f"{name:<16} {account_email(name) or 'not signed in':<36} {status}")
-        for line in usage_lines(usage.get(name, {}), now, color):
+        for line in usage_lines(usage.get(name, {}), state.get(name), now, color):
             print(f"{'':<17}{line}")
     return 0
 
