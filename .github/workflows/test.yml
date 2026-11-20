@@ -3,9 +3,15 @@ on: [push, pull_request]
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ["3.9", "3.13"]
+        # ubuntu-latest (26.04) has no Python 3.9 build; 24.04 is the newest image that does.
+        exclude:
+          - {os: ubuntu-latest, python: "3.9"}
+        include:
+          - {os: ubuntu-24.04, python: "3.9"}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
