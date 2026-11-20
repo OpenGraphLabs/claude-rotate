@@ -113,6 +113,10 @@ default          you@company.com                      limited until 11-03 02:00
 personal         you@gmail.com                        available
                  5h  ███████░░░░░░░░░░░░░   35%  resets 11-02 23:00 · read 11-02 22:31
                  7d  ███░░░░░░░░░░░░░░░░░   14%  resets 11-07 10:00 · read 11-02 22:31
+team             you@team.com                         available · fable limited until 11-05 02:00
+                 5h     ░░░░░░░░░░░░░░░░░░░░    0%
+                 7d     ██████████░░░░░░░░░░   51%  resets 11-05 02:00 · read 11-02 22:31
+                 fable  ████████████████████  100%  resets 11-05 02:00 · limit hit 11-02 18:58
 ```
 
 Claude Code hands these numbers (`rate_limits.five_hour` / `seven_day`: percent used and reset
@@ -148,6 +152,9 @@ What the bars mean:
   as 0 % with no reset time.
 - A window the account's recorded limit names ("You've hit your weekly limit", "... 5-hour
   limit", "... session limit") shows 100 % until that limit ends (`limit hit ...`).
+- A model with its own limit ("You've hit your Fable limit", "You've reached your Fable limit")
+  gets a full bar under the windows until that limit ends. The account stays available: the 7-day
+  bar counts every model, so it can sit well below 100 % while one model is used up.
 - Several sessions on one account each report what they last heard from the API, so the highest
   reading of a window wins until the window resets.
 - Bars turn yellow at 70 % and red at 90 % on a terminal; set `NO_COLOR` to turn colour off.

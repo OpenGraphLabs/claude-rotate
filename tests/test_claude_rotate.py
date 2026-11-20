@@ -289,6 +289,24 @@ class Helpers(unittest.TestCase):
         self.assertEqual(self.m.usage_bar(35, False), "\u2588" * 7 + "\u2591" * 13)
         self.assertIn("\x1b[31m", self.m.usage_bar(95, True))
 
+    def test_model_limit_wordings(self):
+        for text in [FABLE_TEXT, "You've hit your Fable limit · resets Nov 24 at 2am (Asia/Seoul)",
+                     "Switch models to keep using Fable"]:
+            with self.subTest(text=text):
+                self.assertEqual(self.m.limited_model(text), "fable")
+        for text in [LIMIT_TEXT, "You've hit your session limit · resets 3pm", "You've hit your limit"]:
+            with self.subTest(text=text):
+                self.assertIsNone(self.m.limited_model(text))
+
+    def test_usage_lines_add_a_full_bar_per_limited_model(self):
+        state = {"models": {"fable": {"limited_until": 500, "recorded_at": 90},
+                            "opus": {"limited_until": 50, "recorded_at": 10}}}
+        lines = self.m.usage_lines({}, state, now=100)
+        self.assertEqual(lines[:2], ["5h     " + "░" * 20 + "    0%", "7d     " + "░" * 20 + "    0%"])
+        self.assertEqual(len(lines), 3)  # the opus limit has ended
+        self.assertTrue(lines[2].startswith("fable  " + "█" * 20 + "  100%  resets "), lines[2])
+        self.assertIn("limit hit", lines[2])
+
     def test_banner_across_utf8_and_ansi_boundaries(self):
         detector = self.m.TerminalLimitDetector()
         found = [message for byte in BANNER.encode()
